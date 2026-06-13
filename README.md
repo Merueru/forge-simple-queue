@@ -2,18 +2,50 @@
 
 A compact queue manager for Stable Diffusion WebUI Forge and Forge Neo.
 
-![Forge Simple Queue modal](images/simqimg001.png)
+Forge Simple Queue adds a `Queue` button beside the normal `Generate` button, so you can line up txt2img and img2img jobs while the current image is still running.
 
-Forge Simple Queue adds a `Queue` button next to the normal `Generate` button. Jobs can be queued from txt2img or img2img, then managed from a small modal without turning the main WebUI screen into a full scheduler.
+## Queue button
+
+![Queue button beside Generate](images/simqimg001.png)
+
+Click `Queue` to add the current txt2img or img2img settings as the next job. The button shows the current state, such as `Queue`, `Queue (3)`, or `Queue (Running)`.
+
+## Queue modal
+
+![Queue modal with running and pending jobs](images/simqimg004.png)
+
+Open the queue modal to view running and pending jobs. Pending jobs can be paused, resumed, reordered, edited, deleted, or opened for details.
+
+## Edit queued jobs
+
+![Editing a queued prompt](images/simqimg007.png)
+
+Queued prompts can be edited before they start. This is useful when you want to prepare several variations while another job is still generating.
+
+## Auto repeat and bulk delete
+
+![Selected jobs with auto repeat and bulk delete](images/simqimg005.png)
+
+Select jobs with the checkboxes to enable auto repeat or delete multiple pending jobs at once. Running jobs are kept protected from bulk delete.
+
+## History
+
+![History tab with a finished job](images/simqimg006.png)
+
+Finished jobs are shown in the History tab. History is kept bounded so long queue sessions do not keep growing forever.
+
+## Saved queue
+
+![Save queue confirmation](images/simqimg008.png)
+
+Use the saved queue controls to save the current queue, restore it later, or clear the saved snapshot. Saved queue data is local to your Forge installation.
 
 ## Features
 
-![Queue management](images/simqimg001.png)
-
 - Queue txt2img and img2img jobs.
-- View running, waiting, and pending jobs.
+- View running, waiting, pending, and finished jobs.
 - Edit queued prompts before sampling starts.
-- Pause, resume, delete, bulk delete, and reorder pending jobs.
+- Pause, resume, reorder, delete, and bulk delete pending jobs.
 - Stop or skip the active queued generation.
 - Auto repeat selected jobs.
 - Save, restore, or clear a saved queue.
@@ -30,46 +62,12 @@ git clone https://github.com/Merueru/forge-simple-queue.git
 
 Restart Forge or reload the WebUI after installation.
 
-## Usage
-
-1. Set up txt2img or img2img as usual.
-2. Click `Queue` instead of `Generate`.
-3. Continue editing settings and queue more jobs.
-4. Open the queue modal with the small list button beside `Queue`.
-5. Manage pending jobs from the modal.
-
-The main button shows the queue state:
-
-```text
-Queue
-Queue (3)
-Queue (Running)
-```
-
-## Auto Repeat
-
-Select one or more jobs with the checkbox, then enable `Auto repeat`. Forge Simple Queue keeps the selected jobs rotating without filling the queue with endless duplicates.
-
-## Saved Queue
-
-The saved queue controls can save the current queue, restore it later, or clear the saved snapshot. Saved queue data is local to the user's Forge installation and is not meant to be committed to the repository.
-
 ## Notes
 
 - Pending jobs are stored in memory and are cleared when Forge restarts.
 - Active jobs cannot be edited after sampling starts.
 - Result restore depends on Forge's progress / restore-progress behavior.
 - Compatibility can vary between Forge and Forge Neo builds because this extension uses internal WebUI APIs.
-
-## Troubleshooting
-
-If the queue button does not appear, reload the UI or restart Forge.
-
-If progress or gallery restore looks stale, check the browser console and Forge terminal logs for messages prefixed with:
-
-```text
-[Forge Simple Queue]
-```
 
 ## Development
 
@@ -88,4 +86,4 @@ python -c "import ast, pathlib; ast.parse(pathlib.Path('scripts/forge_simple_que
 
 ## License
 
-MIT
+[MIT License](LICENSE)
