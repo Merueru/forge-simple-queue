@@ -718,7 +718,7 @@
     const modalOpen = Boolean(modal?.classList.contains("fsq-open"));
     const active = Boolean(data?.generation_active || data?.active);
     const queueCount = Number(data?.queue_count ?? data?.pending_count ?? 0);
-    if (modalOpen) return 1500;
+    if (modalOpen) return active ? 3000 : 1500;
     if (document.hidden) return active || queueCount > 0 ? 5000 : 12000;
     if (active || queueCount > 0) return 2500;
     return 8000;
