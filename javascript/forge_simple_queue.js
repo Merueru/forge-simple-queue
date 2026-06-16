@@ -209,8 +209,8 @@
   const updateQueueButtons = (data) => {
     const queueCount = Number(data?.queue_count ?? data?.pending_count ?? 0);
     const active = data?.active;
-    const running = Boolean(active && (active.progress_active === true || active.status === "running"));
-    const label = running && queueCount <= 0 ? "Queue (Running)" : (queueCount > 0 ? `Queue (${queueCount})` : "Queue");
+    const running = Boolean(data?.generation_active || (active && (active.progress_active === true || active.status === "running")));
+    const label = running ? "Queue (Running)" : (queueCount > 0 ? `Queue (${queueCount})` : "Queue");
     for (const id of ["txt2img_simple_queue_button", "img2img_simple_queue_button"]) {
       const button = document.getElementById(id);
       if (button && button.textContent !== label) button.textContent = label;
@@ -312,6 +312,18 @@
     }
   };
 
+  const showSubmitButtonsIfIdle = (tab, data = null) => {
+    if (typeof showSubmitButtons !== "function") return;
+    const apply = (state) => {
+      if (!state?.generation_active) showSubmitButtons(tab, true);
+    };
+    if (data) {
+      apply(data);
+    } else {
+      api("/forge-simple-queue/status-lite").then(apply).catch(() => showSubmitButtons(tab, true));
+    }
+  };
+
   const refreshQueueState = async (options = {}) => {
     const serial = ++refreshQueueStateSerial;
     const modal = document.getElementById("forge-simple-queue-modal");
@@ -365,7 +377,7 @@
         galleryContainer,
         gallery,
         () => {
-          if (typeof showSubmitButtons === "function") showSubmitButtons(tab, true);
+          showSubmitButtonsIfIdle(tab);
           if (typeof showRestoreProgressButton === "function") showRestoreProgressButton(tab, true);
           followedTasks.delete(taskId);
           activeTaskByTab.delete(tab);
@@ -390,7 +402,7 @@
           return;
         }
         if ((state.recent_tasks || []).includes(taskId) || (state.history || []).some((job) => job.task_id === taskId)) {
-          if (typeof showSubmitButtons === "function") showSubmitButtons(tab, true);
+          showSubmitButtonsIfIdle(tab, state);
           followedTasks.delete(taskId);
           activeTaskByTab.delete(tab);
           return;
@@ -398,13 +410,13 @@
         await new Promise((resolve) => setTimeout(resolve, 650));
       }
       followedTasks.delete(taskId);
-      if (typeof showSubmitButtons === "function") showSubmitButtons(tab, true);
+      showSubmitButtonsIfIdle(tab);
     };
 
     waitForActive().catch((err) => {
       console.error("[Forge Simple Queue]", err);
       followedTasks.delete(taskId);
-      if (typeof showSubmitButtons === "function") showSubmitButtons(tab, true);
+      showSubmitButtonsIfIdle(tab);
     });
   }
 
@@ -704,7 +716,7 @@
   const queueStatePollDelay = (data) => {
     const modal = document.getElementById("forge-simple-queue-modal");
     const modalOpen = Boolean(modal?.classList.contains("fsq-open"));
-    const active = Boolean(data?.active);
+    const active = Boolean(data?.generation_active || data?.active);
     const queueCount = Number(data?.queue_count ?? data?.pending_count ?? 0);
     if (modalOpen) return 1500;
     if (document.hidden) return active || queueCount > 0 ? 5000 : 12000;
