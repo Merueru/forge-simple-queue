@@ -210,7 +210,7 @@
     const queueCount = Number(data?.queue_count ?? data?.pending_count ?? 0);
     const active = data?.active;
     const running = Boolean(data?.generation_active || (active && (active.progress_active === true || active.status === "running")));
-    const label = running ? "Queue (Running)" : (queueCount > 0 ? `Queue (${queueCount})` : "Queue");
+    const label = queueCount > 0 ? `Queue (${queueCount})` : (running ? "Queue (Running)" : "Queue");
     for (const id of ["txt2img_simple_queue_button", "img2img_simple_queue_button"]) {
       const button = document.getElementById(id);
       if (button && button.textContent !== label) button.textContent = label;
