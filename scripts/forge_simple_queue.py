@@ -92,6 +92,16 @@ def apply_forge_state(state: dict[str, Any]):
             traceback.print_exc()
 
 
+def forge_generation_active() -> bool:
+    state = getattr(shared, "state", None)
+    job_count = getattr(state, "job_count", 0)
+    return (
+        getattr(progress, "current_task", None) is not None
+        or bool(getattr(state, "job", ""))
+        or (isinstance(job_count, int) and job_count != 0)
+    )
+
+
 def stable_fingerprint_value(value: Any) -> Any:
     if value is None or isinstance(value, (int, float, bool)):
         return value
@@ -479,6 +489,7 @@ class SimpleQueue:
             "history": history,
             "pending_count": len(pending_jobs),
             "queue_count": queue_count,
+            "generation_active": forge_generation_active(),
             "compact": compact,
             "recent_tasks": recent_tasks,
             "repeat": repeat,
