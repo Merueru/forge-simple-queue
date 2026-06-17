@@ -89,7 +89,7 @@
       </div>`;
     document.body.appendChild(modal);
     modal.addEventListener("click", (event) => {
-      if (event.target === modal || event.target.classList.contains("fsq-close")) {
+      if (event.target === modal || event.target.closest?.(".fsq-close")) {
         modal.classList.remove("fsq-open");
       }
     });
