@@ -1436,6 +1436,7 @@ SIMPLE_QUEUE_ASSETS = r"""
   width: 16px;
   height: 16px;
   display: block;
+  pointer-events: none;
 }
 .fsq-close:hover {
   background: rgba(127, 29, 29, 0.36);
