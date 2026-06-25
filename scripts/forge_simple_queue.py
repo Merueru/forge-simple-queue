@@ -1149,6 +1149,27 @@ SIMPLE_QUEUE_ASSETS = r"""
   -webkit-mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M5 7h14M5 12h14M5 17h14M3 7h.01M3 12h.01M3 17h.01' stroke='black' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E") center / contain no-repeat;
   mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M5 7h14M5 12h14M5 17h14M3 7h.01M3 12h.01M3 17h.01' stroke='black' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E") center / contain no-repeat;
 }
+.fsq-queue-status-icon {
+  display: inline-flex;
+  width: 1em;
+  height: 1em;
+  margin-left: 0.2em;
+  vertical-align: middle;
+  color: currentColor;
+}
+.fsq-queue-status-icon svg {
+  width: 1em;
+  height: 1em;
+  fill: currentColor;
+}
+button.fsq-queue-paused {
+  background: rgba(245, 158, 11, 0.18) !important;
+  color: #f59e0b !important;
+}
+button.fsq-queue-paused:hover,
+button.fsq-queue-paused:focus {
+  background: rgba(245, 158, 11, 0.26) !important;
+}
 .forge-simple-queue-hidden-status {
   min-height: 20px;
 }
