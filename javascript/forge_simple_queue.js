@@ -206,14 +206,29 @@
     renderModal(data);
   };
 
+  const queuePausedIcon = `<span class="fsq-queue-status-icon" aria-hidden="true"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M7 5h4v14H7zM13 5h4v14h-4z"></path></svg></span>`;
+
   const updateQueueButtons = (data) => {
     const queueCount = Number(data?.queue_count ?? data?.pending_count ?? 0);
     const active = data?.active;
     const running = Boolean(data?.generation_active || (active && (active.progress_active === true || active.status === "running")));
+    const paused = Boolean(data?.control?.paused);
     const label = queueCount > 0 ? `Queue (${queueCount})` : (running ? "Queue (Running)" : "Queue");
     for (const id of ["txt2img_simple_queue_button", "img2img_simple_queue_button"]) {
       const button = document.getElementById(id);
-      if (button && button.textContent !== label) button.textContent = label;
+      if (!button) continue;
+      const wasPaused = button.classList.contains("fsq-queue-paused");
+      if (paused && !wasPaused) {
+        button.innerHTML = `Queue (${queuePausedIcon})`;
+        button.classList.add("fsq-queue-paused");
+        button.title = "Resume queue";
+      } else if (!paused && wasPaused) {
+        button.textContent = label;
+        button.classList.remove("fsq-queue-paused");
+        button.removeAttribute("title");
+      } else if (!paused && button.textContent !== label) {
+        button.textContent = label;
+      }
     }
   };
 
@@ -460,6 +475,22 @@
       event.stopPropagation();
       document.querySelectorAll(".fsq-tab").forEach((button) => button.classList.toggle("fsq-active", button === tabButton));
       await refreshQueueState();
+      return;
+    }
+
+    const queueButton = event.target.closest("#txt2img_simple_queue_button, #img2img_simple_queue_button");
+    if (queueButton && queueButton.classList.contains("fsq-queue-paused")) {
+      event.preventDefault();
+      event.stopPropagation();
+      queueButton.disabled = true;
+      try {
+        await api("/forge-simple-queue/control", {action: "play"});
+        await refreshQueueState();
+      } catch (err) {
+        console.error("[Forge Simple Queue]", err);
+      } finally {
+        queueButton.disabled = false;
+      }
       return;
     }
 
