@@ -5,6 +5,7 @@ import pickle
 import hashlib
 import html
 import json
+import statistics
 import threading
 import time
 import traceback
@@ -152,6 +153,8 @@ class QueueJob:
         self.repeat_id = repeat_id or job_id
         self.repeat_placeholder = repeat_placeholder
         self.created_at = time.time()
+        self.started_at: float | None = None
+        self.completed_at: float | None = None
         self.status = "queued"
         self.paused = repeat_placeholder
         self.cancel_requested = False
@@ -211,6 +214,18 @@ class QueueJob:
         self._negative_prompt_snapshot = None
         self._summary_snapshot = None
 
+    def duration_seconds(self) -> float | None:
+        if self.started_at is None or self.completed_at is None:
+            return None
+        return max(0.0, self.completed_at - self.started_at)
+
+    def timing_profile(self) -> str:
+        return json.dumps({
+            "tab": self.tab,
+            "summary": self.summary(),
+            "forge": stable_fingerprint_value(self.forge_state),
+        }, sort_keys=True, separators=(",", ":"))
+
     def to_dict(
         self,
         index: int | None = None,
@@ -233,6 +248,7 @@ class QueueJob:
             "progress_active": self.task_id == getattr(progress, "current_task", None),
             "progress_queued": self.task_id in getattr(progress, "pending_tasks", {}),
             "age": max(0, int(time.time() - self.created_at)),
+            "duration_seconds": self.duration_seconds(),
             "prompt": self.prompt,
             "negative_prompt": self.negative_prompt,
             "summary": self.summary(),
@@ -276,6 +292,8 @@ class QueueJob:
             repeat_placeholder=self.repeat_placeholder,
         )
         history_job.created_at = self.created_at
+        history_job.started_at = self.started_at
+        history_job.completed_at = self.completed_at
         history_job.status = self.status
         history_job.paused = self.paused
         history_job.cancel_requested = self.cancel_requested
@@ -356,6 +374,13 @@ class SimpleQueue:
         self._repeat_enabled = False
         self._repeat_order: list[str] = []
         self._repeat_templates: dict[str, QueueJob] = {}
+        self._recovery_path = Path(__file__).resolve().parent.parent / "data" / "recovery_queue.pkl"
+        self._recovery_snapshot: dict[str, Any] | None = self._load_recovery_snapshot()
+        self._recovery_enabled = bool(self._recovery_snapshot.get("enabled", True)) if self._recovery_snapshot else True
+        self._recovered_count = 0
+        self._recovery_checkpoint_timer: threading.Timer | None = None
+        with self._condition:
+            self._restore_recovery_payload_locked(self._recovery_snapshot)
         self._worker_started = False
         self._api_registered = False
 
@@ -436,6 +461,10 @@ class SimpleQueue:
         def repeat_all(payload: dict[str, Any] = Body(default={})):
             return self.set_repeat_all(bool(payload.get("selected")))
 
+        @app.post("/forge-simple-queue/recovery")
+        def recovery(payload: dict[str, Any] = Body(default={})):
+            return self.set_recovery_enabled(bool(payload.get("enabled", True)))
+
         @app.get("/forge-simple-queue/saved-queue/status")
         def saved_queue_status():
             return self.saved_queue_status()
@@ -487,6 +516,7 @@ class SimpleQueue:
         with self._condition:
             self._pending.append(job)
             self._condition.notify_all()
+        self._schedule_recovery_checkpoint()
 
         print(f"[Forge Simple Queue] Queued {tab} job {job_id}.")
         return (
@@ -514,6 +544,7 @@ class SimpleQueue:
                 "paused": self._queue_paused,
             }
             saved_queue = self._saved_queue_summary_locked()
+            eta = self._estimate_remaining_locked()
         return {
             "active": active,
             "pending": pending,
@@ -526,7 +557,88 @@ class SimpleQueue:
             "repeat": repeat,
             "control": control,
             "saved_queue": saved_queue,
+            "eta": eta,
+            "recovery": {
+                "enabled": self._recovery_enabled,
+                "recovered_count": self._recovered_count,
+            },
         }
+
+    def _recovery_payload_locked(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "saved_at": time.time(),
+            "enabled": self._recovery_enabled,
+            "jobs": [self._job_snapshot(job) for job in self._recovery_queue_jobs_locked()],
+        }
+
+    def _recovery_queue_jobs_locked(self) -> list[QueueJob]:
+        jobs: list[QueueJob] = []
+        active_job = self._active or self._waiting
+        if active_job is not None and not active_job.cancel_requested:
+            jobs.append(active_job)
+        for job in self._pending:
+            if job is active_job or job is self._waiting or job.cancel_requested:
+                continue
+            jobs.append(job)
+        return jobs
+
+    def _checkpoint_recovery(self):
+        with self._condition:
+            self._recovery_checkpoint_timer = None
+            if not self._recovery_enabled:
+                return
+            payload = self._recovery_payload_locked()
+        try:
+            self._write_recovery_snapshot(payload)
+        except Exception:
+            print("[Forge Simple Queue] Failed to checkpoint recovery queue:")
+            traceback.print_exc()
+
+    def _schedule_recovery_checkpoint(self):
+        with self._condition:
+            if not self._recovery_enabled:
+                return
+            if self._recovery_checkpoint_timer is not None:
+                self._recovery_checkpoint_timer.cancel()
+            timer = threading.Timer(0.5, self._checkpoint_recovery)
+            timer.daemon = True
+            self._recovery_checkpoint_timer = timer
+            timer.start()
+
+    def _restore_recovery_payload_locked(self, payload: dict[str, Any] | None):
+        if not self._recovery_enabled or not isinstance(payload, dict):
+            return
+        jobs = [self._job_from_snapshot(item) for item in payload.get("jobs", [])]
+        jobs = [job for job in jobs if job is not None]
+        if not jobs:
+            return
+        self._pending = deque(jobs)
+        self._queue_paused = True
+        self._queue_mode = "pause"
+        self._repeat_enabled = False
+        self._repeat_order = []
+        self._repeat_templates = {}
+        self._recovered_count = len(jobs)
+
+    def set_recovery_enabled(self, enabled: bool) -> dict[str, Any]:
+        with self._condition:
+            self._recovery_enabled = enabled
+            if self._recovery_checkpoint_timer is not None:
+                self._recovery_checkpoint_timer.cancel()
+                self._recovery_checkpoint_timer = None
+            payload = self._recovery_payload_locked()
+            if not enabled:
+                payload["jobs"] = []
+        try:
+            self._write_recovery_snapshot(payload)
+        except Exception:
+            print("[Forge Simple Queue] Failed to update recovery setting:")
+            traceback.print_exc()
+            return {"ok": False, "message": "Failed to update recovery setting."}
+        data = self.snapshot()
+        data.update({"ok": True, "message": "Recovery enabled." if enabled else "Recovery disabled."})
+        return data
 
     def saved_queue_status(self) -> dict[str, Any]:
         with self._condition:
@@ -606,6 +718,7 @@ class SimpleQueue:
                 self._ensure_selected_placeholders_locked()
             self._condition.notify_all()
 
+        self._checkpoint_recovery()
         data = self.snapshot()
         data["ok"] = True
         data["message"] = f"Restored {len(jobs)} saved job(s)."
@@ -644,12 +757,33 @@ class SimpleQueue:
             traceback.print_exc()
             return None
 
+    def _load_recovery_snapshot(self) -> dict[str, Any] | None:
+        try:
+            if not self._recovery_path.exists():
+                return None
+            with self._recovery_path.open("rb") as handle:
+                payload = pickle.load(handle)
+            if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+                return None
+            return payload
+        except Exception:
+            print("[Forge Simple Queue] Failed to load recovery queue:")
+            traceback.print_exc()
+            return None
+
     def _write_saved_snapshot(self, payload: dict[str, Any]):
         self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self._snapshot_path.with_suffix(".tmp")
         with tmp_path.open("wb") as handle:
             pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
         tmp_path.replace(self._snapshot_path)
+
+    def _write_recovery_snapshot(self, payload: dict[str, Any]):
+        self._recovery_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._recovery_path.with_suffix(".tmp")
+        with tmp_path.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_path.replace(self._recovery_path)
 
     def _saved_queue_count_locked(self) -> int:
         if not self._saved_snapshot:
@@ -745,6 +879,7 @@ class SimpleQueue:
                     group["failures"] += 1
                 if job.status == "deleted":
                     group["deleted"] += 1
+                self._add_history_duration(group, job)
                 continue
 
             group = self._job_dict(
@@ -753,11 +888,72 @@ class SimpleQueue:
                 failures=1 if job.status == "failed" else 0,
                 deleted=1 if job.status == "deleted" else 0,
             )
+            group["timed_runs"] = 0
+            group["_duration_total"] = 0.0
+            self._add_history_duration(group, job)
             by_fingerprint[fingerprint] = group
             groups.append(group)
             if len(groups) >= 30:
                 break
+        for group in groups:
+            timed_runs = group.pop("timed_runs")
+            duration_total = group.pop("_duration_total")
+            group["duration_seconds"] = duration_total / timed_runs if timed_runs else None
+            group["timed_runs"] = timed_runs
         return groups
+
+    @staticmethod
+    def _add_history_duration(group: dict[str, Any], job: QueueJob):
+        duration = job.duration_seconds()
+        if duration is not None:
+            group["timed_runs"] += 1
+            group["_duration_total"] += duration
+
+    def _estimate_remaining_locked(self, now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        active_job = self._active or self._waiting
+        queue_jobs: list[QueueJob] = []
+        seen: set[int] = set()
+        for job in [active_job, *self._pending]:
+            if job is None or id(job) in seen or job.cancel_requested:
+                continue
+            seen.add(id(job))
+            queue_jobs.append(job)
+        if not queue_jobs:
+            return {"seconds": None, "sample_count": 0, "unknown_jobs": 0}
+
+        samples: dict[str, list[float]] = {}
+        for job in self._history:
+            duration = job.duration_seconds()
+            if job.status != "done" or duration is None:
+                continue
+            samples.setdefault(job.timing_profile(), []).append(duration)
+
+        estimates: dict[str, float] = {
+            profile: float(statistics.median(durations))
+            for profile, durations in samples.items()
+        }
+        unknown_jobs = 0
+        total_seconds = 0.0
+        used_profiles: set[str] = set()
+        for job in queue_jobs:
+            profile = job.timing_profile()
+            estimate = estimates.get(profile)
+            if estimate is None:
+                unknown_jobs += 1
+                continue
+            used_profiles.add(profile)
+            if job is active_job and job is self._active and job.status == "running" and job.started_at is not None:
+                estimate = max(0.0, estimate - (now - job.started_at))
+            total_seconds += estimate
+
+        if unknown_jobs:
+            return {"seconds": None, "sample_count": sum(len(samples[profile]) for profile in used_profiles), "unknown_jobs": unknown_jobs}
+        return {
+            "seconds": round(total_seconds, 1),
+            "sample_count": sum(len(samples[profile]) for profile in used_profiles),
+            "unknown_jobs": 0,
+        }
 
     def _append_history_locked(self, job: QueueJob):
         if any(item.id == job.id for item in self._history):
@@ -775,6 +971,8 @@ class SimpleQueue:
             if deleted:
                 self._condition.notify_all()
                 self._restore_forge_state_if_idle_locked()
+        if deleted:
+            self._schedule_recovery_checkpoint()
         return self.snapshot()
 
     def delete_many(self, job_ids: list[str]) -> dict[str, Any]:
@@ -789,6 +987,8 @@ class SimpleQueue:
                 if deleted:
                     self._condition.notify_all()
                     self._restore_forge_state_if_idle_locked()
+        if deleted:
+            self._schedule_recovery_checkpoint()
         data = self.snapshot()
         data["ok"] = True
         data["deleted_count"] = deleted
@@ -808,6 +1008,7 @@ class SimpleQueue:
         self._remove_repeat_locked(job.repeat_id)
 
     def set_paused(self, job_id: str, paused: bool) -> dict[str, Any]:
+        changed = False
         with self._condition:
             for job in self._pending:
                 if job.id == job_id:
@@ -821,10 +1022,14 @@ class SimpleQueue:
                     if not paused and job.status == "waiting":
                         job.status = "queued"
                     self._condition.notify_all()
+                    changed = True
                     break
+        if changed:
+            self._schedule_recovery_checkpoint()
         return self.snapshot()
 
     def move(self, job_id: str, index: int) -> dict[str, Any]:
+        moved = False
         with self._condition:
             jobs = list(self._pending)
             job = next((item for item in jobs if item.id == job_id), None)
@@ -835,16 +1040,23 @@ class SimpleQueue:
                 self._pending = deque(jobs)
                 self._sync_repeat_order_locked()
                 self._condition.notify_all()
+                moved = True
+        if moved:
+            self._schedule_recovery_checkpoint()
         return self.snapshot()
 
     def update_job(self, job_id: str, prompt: str | None, negative_prompt: str | None) -> dict[str, Any]:
+        updated = False
         with self._condition:
             for job in self._pending:
                 if job.id == job_id:
                     job.update_text(prompt, negative_prompt)
                     if job.repeat_id in self._repeat_order:
                         self._repeat_templates[job.repeat_id] = job
+                    updated = True
                     break
+        if updated:
+            self._schedule_recovery_checkpoint()
         return self.snapshot()
 
     def begin_full_edit(self, job_id: str) -> dict[str, Any]:
@@ -854,7 +1066,9 @@ class SimpleQueue:
                 return {"ok": False, "message": "This queued job can no longer be edited."}
             job.editing = True
             self._condition.notify_all()
-            return {"ok": True, "args": [_copy_value(value) for value in job.args]}
+            result = {"ok": True, "args": [_copy_value(value) for value in job.args]}
+        self._schedule_recovery_checkpoint()
+        return result
 
     def finish_full_edit(self, job_id: str, raw_args: tuple[Any, ...] | list[Any]) -> dict[str, Any]:
         with self._condition:
@@ -873,7 +1087,9 @@ class SimpleQueue:
             if job.repeat_id in self._repeat_order:
                 self._repeat_templates[job.repeat_id] = job
             self._condition.notify_all()
-            return {"ok": True, "message": "Queued job updated."}
+            result = {"ok": True, "message": "Queued job updated."}
+        self._schedule_recovery_checkpoint()
+        return result
 
     def cancel_full_edit(self, job_id: str) -> dict[str, Any]:
         with self._condition:
@@ -882,7 +1098,9 @@ class SimpleQueue:
                 return {"ok": False, "message": "This queued job is not being edited."}
             job.editing = False
             self._condition.notify_all()
-            return {"ok": True, "message": "Full edit cancelled."}
+            result = {"ok": True, "message": "Full edit cancelled."}
+        self._schedule_recovery_checkpoint()
+        return result
 
     def copy_job(self, job_id: str) -> dict[str, Any]:
         with self._condition:
@@ -891,6 +1109,7 @@ class SimpleQueue:
                 return {"ok": False, "message": "The source job is no longer available."}
             self._pending.append(source.clone_as_copy())
             self._condition.notify_all()
+        self._schedule_recovery_checkpoint()
         result = self.snapshot()
         result.update({"ok": True, "message": "Copied job to the end of the queue."})
         return result
@@ -928,6 +1147,7 @@ class SimpleQueue:
                 self._ensure_selected_placeholders_locked()
             self._condition.notify_all()
             self._restore_forge_state_if_idle_locked()
+        self._schedule_recovery_checkpoint()
         return self.snapshot()
 
     def set_repeat_all(self, selected: bool) -> dict[str, Any]:
@@ -944,6 +1164,7 @@ class SimpleQueue:
                 self._ensure_selected_placeholders_locked()
             self._condition.notify_all()
             self._restore_forge_state_if_idle_locked()
+        self._schedule_recovery_checkpoint()
         return self.snapshot()
 
     def disable_repeat(self):
@@ -951,6 +1172,7 @@ class SimpleQueue:
             self._repeat_enabled = False
             self._ensure_selected_placeholders_locked()
             self._condition.notify_all()
+        self._schedule_recovery_checkpoint()
 
     def control(self, action: str) -> dict[str, Any]:
         action = (action or "").lower()
@@ -980,6 +1202,7 @@ class SimpleQueue:
 
         if interrupt:
             shared.state.interrupt()
+        self._schedule_recovery_checkpoint()
         return self.snapshot()
 
     def _find_job_locked(self, job_id: str) -> QueueJob | None:
@@ -1138,8 +1361,10 @@ class SimpleQueue:
                     if self._waiting is job:
                         self._waiting = None
                     job.status = "running"
+                    job.started_at = time.time()
                     self._active = job
 
+                self._checkpoint_recovery()
                 self._run_job_with_lock(job)
                 if job.status != "deleted":
                     job.status = "done"
@@ -1151,6 +1376,7 @@ class SimpleQueue:
             finally:
                 call_queue.queue_lock.release()
                 with self._condition:
+                    job.completed_at = time.time()
                     if self._active is job:
                         self._active = None
                     if self._waiting is job:
@@ -1164,6 +1390,7 @@ class SimpleQueue:
                             self._ensure_selected_placeholders_locked()
                     self._condition.notify_all()
                     self._restore_forge_state_if_idle_locked()
+                self._checkpoint_recovery()
 
     def _next_ready_job_locked(self) -> QueueJob | None:
         if self._queue_paused:
@@ -1229,8 +1456,14 @@ SIMPLE_QUEUE_ASSETS = r"""
   min-width: 0 !important;
 }
 #txt2img_simple_queue_button, #img2img_simple_queue_button,
-#txt2img_simple_queue_button button, #img2img_simple_queue_button button {
-  border-radius: 12px !important;
+#txt2img_simple_queue_view, #img2img_simple_queue_view,
+#txt2img_simple_queue_button button, #img2img_simple_queue_button button,
+#txt2img_simple_queue_view button, #img2img_simple_queue_view button,
+#txt2img_simple_queue_update, #img2img_simple_queue_update,
+#txt2img_simple_queue_cancel, #img2img_simple_queue_cancel,
+#txt2img_simple_queue_update button, #img2img_simple_queue_update button,
+#txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
+  border-radius: 14px !important;
 }
 .forge-simple-queue-full-edit-actions {
   width: 100%;
@@ -1248,7 +1481,21 @@ SIMPLE_QUEUE_ASSETS = r"""
 #txt2img_simple_queue_update button, #img2img_simple_queue_update button,
 #txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
   flex: 1 1 0;
-  border-radius: 12px !important;
+}
+#txt2img_simple_queue_button, #img2img_simple_queue_button,
+#txt2img_simple_queue_view, #img2img_simple_queue_view,
+#txt2img_simple_queue_button button, #img2img_simple_queue_button button,
+#txt2img_simple_queue_view button, #img2img_simple_queue_view button {
+  background: #465467 !important;
+  border-color: #5b6b80 !important;
+  color: #f8fafc !important;
+}
+#txt2img_simple_queue_button:hover, #img2img_simple_queue_button:hover,
+#txt2img_simple_queue_view:hover, #img2img_simple_queue_view:hover,
+#txt2img_simple_queue_button button:hover, #img2img_simple_queue_button button:hover,
+#txt2img_simple_queue_view button:hover, #img2img_simple_queue_view button:hover {
+  background: #526278 !important;
+  border-color: #7a8ca4 !important;
 }
 #txt2img_simple_queue_update button, #img2img_simple_queue_update button,
 #txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
@@ -1655,6 +1902,14 @@ button.fsq-queue-paused:focus {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+.fsq-eta {
+  margin-left: 8px;
+  color: rgba(156, 163, 175, 0.72);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
 .fsq-empty {
   padding: 18px;
   border: 1px dashed rgba(148, 163, 184, 0.22);
@@ -1766,8 +2021,10 @@ button.fsq-queue-paused:focus {
 .fsq-actions {
   display: flex;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  align-items: center;
   justify-content: flex-end;
+  white-space: nowrap;
 }
 .fsq-actions button, .fsq-save {
   height: 30px;
@@ -1781,12 +2038,25 @@ button.fsq-queue-paused:focus {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
+  box-sizing: border-box !important;
+  width: 30px !important;
+  min-width: 30px !important;
+  max-width: 30px !important;
+  height: 30px !important;
+  min-height: 30px !important;
+  max-height: 30px !important;
   padding: 0;
 }
 .fsq-icon-action svg {
+  display: block;
+  flex: 0 0 auto;
   width: 16px;
   height: 16px;
+}
+.fsq-actions .fsq-delete:hover {
+  background: rgba(185, 28, 28, 0.42) !important;
+  border-color: rgba(252, 165, 165, 0.68) !important;
+  color: #fee2e2 !important;
 }
 .fsq-actions button {
   padding: 0 9px;
@@ -1797,7 +2067,7 @@ button.fsq-queue-paused:focus {
   gap: 8px;
   margin-top: 8px;
 }
-.fsq-details {
+.fsq-details-panel {
   display: none;
   grid-column: 3 / 5;
   margin-top: 8px;
@@ -1805,7 +2075,7 @@ button.fsq-queue-paused:focus {
   font-size: 12px;
   line-height: 1.45;
 }
-.fsq-editor.fsq-open, .fsq-details.fsq-open {
+.fsq-editor.fsq-open, .fsq-details-panel.fsq-open {
   display: grid;
 }
 .fsq-editor-actions {
