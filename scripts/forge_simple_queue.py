@@ -156,6 +156,7 @@ class QueueJob:
         self.paused = repeat_placeholder
         self.cancel_requested = False
         self.error: str | None = None
+        self.editing = False
         self._fingerprint_cache: str | None = None
         self._prompt_snapshot: str | None = None
         self._negative_prompt_snapshot: str | None = None
@@ -227,6 +228,7 @@ class QueueJob:
             "tab": self.tab,
             "index": index,
             "status": "paused" if self.paused and self.status == "queued" else self.status,
+            "editing": self.editing,
             "paused": self.paused,
             "progress_active": self.task_id == getattr(progress, "current_task", None),
             "progress_queued": self.task_id in getattr(progress, "pending_tasks", {}),
@@ -266,8 +268,8 @@ class QueueJob:
             self.id,
             self.task_id,
             self.tab,
-            [self.task_id],
-            [self.input_keys[0] if self.input_keys else None],
+            [_copy_value(value) for value in self.args],
+            list(self.input_keys),
             _copy_value(self.forge_state),
             self.username,
             repeat_id=self.repeat_id,
@@ -300,6 +302,22 @@ class QueueJob:
             self.username,
             repeat_id=self.repeat_id,
             repeat_placeholder=repeat_placeholder,
+        )
+
+    def clone_as_copy(self) -> "QueueJob":
+        job_id = uuid4().hex[:12]
+        task_id = f"task(simple-queue-{job_id})"
+        args = [_copy_value(value) for value in self.args]
+        if args:
+            args[0] = task_id
+        return QueueJob(
+            job_id,
+            task_id,
+            self.tab,
+            args,
+            list(self.input_keys),
+            _copy_value(self.forge_state),
+            self.username,
         )
 
     def fingerprint(self) -> str:
@@ -392,6 +410,19 @@ class SimpleQueue:
                 payload.get("prompt"),
                 payload.get("negative_prompt"),
             )
+
+        @app.post("/forge-simple-queue/full-edit/cancel")
+        def cancel_full_edit(payload: dict[str, Any] = Body(default={})):
+            return self.cancel_full_edit(str(payload.get("id", "")))
+
+        @app.post("/forge-simple-queue/copy")
+        def copy_job(payload: dict[str, Any] = Body(default={})): 
+            return self.copy_job(str(payload.get("id", "")))
+
+        @app.post("/forge-simple-queue/reuse")
+        def reuse_job(payload: dict[str, Any] = Body(default={})): 
+            result = self.reuse_job(str(payload.get("id", "")))
+            return {key: value for key, value in result.items() if key != "args"}
 
         @app.post("/forge-simple-queue/repeat")
         def repeat(payload: dict[str, Any] = Body(default={})):
@@ -816,6 +847,65 @@ class SimpleQueue:
                     break
         return self.snapshot()
 
+    def begin_full_edit(self, job_id: str) -> dict[str, Any]:
+        with self._condition:
+            job = next((item for item in self._pending if item.id == job_id), None)
+            if job is None or job.status not in ("queued", "waiting") or job.cancel_requested:
+                return {"ok": False, "message": "This queued job can no longer be edited."}
+            job.editing = True
+            self._condition.notify_all()
+            return {"ok": True, "args": [_copy_value(value) for value in job.args]}
+
+    def finish_full_edit(self, job_id: str, raw_args: tuple[Any, ...] | list[Any]) -> dict[str, Any]:
+        with self._condition:
+            job = next((item for item in self._pending if item.id == job_id), None)
+            if job is None or not job.editing:
+                return {"ok": False, "message": "This queued job is not being edited."}
+            if len(raw_args) != len(job.input_keys):
+                return {"ok": False, "message": "The current page inputs do not match this queued job."}
+            job.args = [_copy_value(value) for value in raw_args]
+            job.args[0] = job.task_id
+            job.editing = False
+            job._fingerprint_cache = None
+            job._prompt_snapshot = None
+            job._negative_prompt_snapshot = None
+            job._summary_snapshot = None
+            if job.repeat_id in self._repeat_order:
+                self._repeat_templates[job.repeat_id] = job
+            self._condition.notify_all()
+            return {"ok": True, "message": "Queued job updated."}
+
+    def cancel_full_edit(self, job_id: str) -> dict[str, Any]:
+        with self._condition:
+            job = next((item for item in self._pending if item.id == job_id), None)
+            if job is None or not job.editing:
+                return {"ok": False, "message": "This queued job is not being edited."}
+            job.editing = False
+            self._condition.notify_all()
+            return {"ok": True, "message": "Full edit cancelled."}
+
+    def copy_job(self, job_id: str) -> dict[str, Any]:
+        with self._condition:
+            source = self._find_job_locked(job_id)
+            if source is None:
+                return {"ok": False, "message": "The source job is no longer available."}
+            self._pending.append(source.clone_as_copy())
+            self._condition.notify_all()
+        result = self.snapshot()
+        result.update({"ok": True, "message": "Copied job to the end of the queue."})
+        return result
+
+    def reuse_job(self, job_id: str) -> dict[str, Any]:
+        with self._condition:
+            source = self._find_job_locked(job_id)
+            if source is None or not source.args or len(source.args) != len(source.input_keys):
+                return {"ok": False, "message": "The source job settings are no longer available."}
+            return {
+                "ok": True,
+                "tab": source.tab,
+                "args": [_copy_value(value) for value in source.args],
+            }
+
     def set_repeat(self, enabled: Any = None, job_id: Any = None, selected: Any = None) -> dict[str, Any]:
         with self._condition:
             if enabled is not None:
@@ -1035,7 +1125,7 @@ class SimpleQueue:
 
             try:
                 with self._condition:
-                    if job.cancel_requested or job.paused or job.repeat_placeholder or self._queue_paused or job not in self._pending:
+                    if job.cancel_requested or job.paused or job.repeat_placeholder or job.editing or self._queue_paused or job not in self._pending:
                         if self._waiting is job:
                             self._waiting = None
                         if not job.cancel_requested and job in self._pending and job.status == "waiting":
@@ -1078,7 +1168,12 @@ class SimpleQueue:
     def _next_ready_job_locked(self) -> QueueJob | None:
         if self._queue_paused:
             return None
-        return next((job for job in self._pending if not job.paused and not job.repeat_placeholder), None)
+        for job in self._pending:
+            if job.editing:
+                return None
+            if not job.paused and not job.repeat_placeholder:
+                return job
+        return None
 
     def _run_job_with_lock(self, job: QueueJob):
         runner = txt2img.txt2img if job.tab == "txt2img" else img2img.img2img
@@ -1133,6 +1228,43 @@ SIMPLE_QUEUE_ASSETS = r"""
 .forge-simple-queue-row button {
   min-width: 0 !important;
 }
+#txt2img_simple_queue_button, #img2img_simple_queue_button,
+#txt2img_simple_queue_button button, #img2img_simple_queue_button button {
+  border-radius: 12px !important;
+}
+.forge-simple-queue-full-edit-actions {
+  width: 100%;
+}
+.forge-simple-queue-full-edit-actions > .form {
+  gap: 8px;
+}
+.forge-simple-queue-full-edit-actions .form,
+.forge-simple-queue-full-edit-actions .gradio-row {
+  gap: 8px !important;
+}
+.forge-simple-queue-full-edit-actions button,
+#txt2img_simple_queue_update, #img2img_simple_queue_update,
+#txt2img_simple_queue_cancel, #img2img_simple_queue_cancel,
+#txt2img_simple_queue_update button, #img2img_simple_queue_update button,
+#txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
+  flex: 1 1 0;
+  border-radius: 12px !important;
+}
+#txt2img_simple_queue_update button, #img2img_simple_queue_update button,
+#txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
+  transition: background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease, transform 0.14s ease;
+}
+#txt2img_simple_queue_update button:hover, #img2img_simple_queue_update button:hover {
+  filter: brightness(1.12);
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.3);
+  transform: translateY(-1px);
+}
+#txt2img_simple_queue_cancel button:hover, #img2img_simple_queue_cancel button:hover {
+  background: #334155;
+  border-color: rgba(147, 197, 253, 0.56);
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.3);
+  transform: translateY(-1px);
+}
 .forge-simple-queue-view-button {
   width: 44px !important;
   min-width: 44px !important;
@@ -1178,6 +1310,11 @@ button.fsq-queue-paused:focus {
   color: #93c5fd;
   font-size: 12px;
   font-weight: 700;
+}
+.fsq-cross-tab-status {
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 600;
 }
 .fsq-backdrop {
   position: fixed;
@@ -1467,6 +1604,32 @@ button.fsq-queue-paused:focus {
 .fsq-close:active {
   transform: translateY(1px);
 }
+.fsq-panel button {
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, transform 0.14s ease;
+}
+.fsq-panel button:not(:disabled):not(.fsq-close):hover {
+  background: #334155;
+  border-color: rgba(147, 197, 253, 0.56);
+  color: #f8fafc;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.32);
+  transform: translateY(-1px);
+}
+.fsq-panel button:not(:disabled):not(.fsq-close):active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+.fsq-panel .fsq-control-active[data-queue-control="play"]:hover {
+  background: rgba(34, 197, 94, 0.28);
+  color: #bbf7d0;
+}
+.fsq-panel .fsq-control-active[data-queue-control="pause"]:hover {
+  background: rgba(245, 158, 11, 0.28);
+  color: #fde68a;
+}
+.fsq-panel .fsq-control-active[data-queue-control="stop"]:hover {
+  background: rgba(239, 68, 68, 0.28);
+  color: #fecaca;
+}
 .fsq-body {
   max-height: calc(min(760px, calc(100vh - 44px)) - 64px);
   overflow: auto;
@@ -1516,6 +1679,16 @@ button.fsq-queue-paused:focus {
 .fsq-job.fsq-dragging {
   opacity: 0.55;
 }
+.fsq-job.fsq-drop-before {
+  box-shadow: 0 -3px 0 #60a5fa;
+}
+.fsq-job.fsq-drop-after {
+  box-shadow: 0 3px 0 #60a5fa;
+}
+.fsq-job.fsq-reordered {
+  border-color: rgba(96, 165, 250, 0.82);
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.18);
+}
 .fsq-repeat-check, .fsq-repeat-spacer {
   display: inline-flex;
   align-items: center;
@@ -1546,6 +1719,15 @@ button.fsq-queue-paused:focus {
   font-weight: 700;
   color: #f9fafb;
 }
+.fsq-identity {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: #93c5fd;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
 .fsq-meta {
   margin-top: 4px;
   overflow: hidden;
@@ -1569,6 +1751,10 @@ button.fsq-queue-paused:focus {
   background: rgba(245, 158, 11, 0.14);
   color: #fbbf24;
 }
+.fsq-status.editing {
+  background: rgba(168, 85, 247, 0.16);
+  color: #d8b4fe;
+}
 .fsq-status.done {
   background: rgba(34, 197, 94, 0.14);
   color: #86efac;
@@ -1590,6 +1776,17 @@ button.fsq-queue-paused:focus {
   background: #263244;
   color: #f9fafb;
   cursor: pointer;
+}
+.fsq-actions .fsq-icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  padding: 0;
+}
+.fsq-icon-action svg {
+  width: 16px;
+  height: 16px;
 }
 .fsq-actions button {
   padding: 0 9px;
@@ -1640,6 +1837,14 @@ class Script(scripts.Script):
         self.queue_column = None
         self.queue_button = None
         self.queue_status = None
+        self.queue_actions = None
+        self.full_edit_actions = None
+        self.full_edit_job_id = None
+        self.full_edit_load_button = None
+        self.full_edit_update_button = None
+        self.full_edit_cancel_button = None
+        self.reuse_job_id = None
+        self.reuse_load_button = None
         self.queue_bound = False
         script_callbacks.on_app_started(lambda _block, app: self.on_app_started(app))
 
@@ -1708,8 +1913,19 @@ class Script(scripts.Script):
             self.queue_column = column
             gr.HTML(SIMPLE_QUEUE_ASSETS if not self.is_img2img else "")
             with gr.Row(elem_classes=["forge-simple-queue-row"]):
-                self.queue_button = gr.Button("Queue", elem_id=f"{tab}_simple_queue_button", variant="secondary")
+                with gr.Group() as queue_actions:
+                    self.queue_button = gr.Button("Queue", elem_id=f"{tab}_simple_queue_button", variant="secondary")
+                self.queue_actions = queue_actions
+                with gr.Group(visible=False, elem_id=f"{tab}_simple_queue_full_edit_actions", elem_classes=["forge-simple-queue-full-edit-actions"]) as full_edit_actions:
+                    with gr.Row():
+                        self.full_edit_update_button = gr.Button("Update", variant="secondary", elem_id=f"{tab}_simple_queue_update", elem_classes=["forge-simple-queue-full-edit-update"])
+                        self.full_edit_cancel_button = gr.Button("Cancel", elem_id=f"{tab}_simple_queue_cancel", elem_classes=["forge-simple-queue-full-edit-cancel"])
+                self.full_edit_actions = full_edit_actions
                 gr.Button("", elem_id=f"{tab}_simple_queue_view", elem_classes=["forge-simple-queue-view-button"])
+            self.full_edit_job_id = gr.Textbox("", visible=False, elem_id=f"{tab}_simple_queue_full_edit_job_id")
+            self.full_edit_load_button = gr.Button("", visible=False, elem_id=f"{tab}_simple_queue_full_edit_load")
+            self.reuse_job_id = gr.Textbox("", visible=False, elem_id=f"{tab}_simple_queue_reuse_job_id")
+            self.reuse_load_button = gr.Button("", visible=False, elem_id=f"{tab}_simple_queue_reuse_load")
             self.queue_status = gr.HTML("", elem_id=f"{tab}_simple_queue_status", elem_classes=["forge-simple-queue-hidden-status"])
 
     def _bind_queue_button(self, tab: str, inputs: list[Any]):
@@ -1722,6 +1938,61 @@ class Script(scripts.Script):
             fn=enqueue_current,
             inputs=inputs,
             outputs=self.queue_status,
+            show_progress=False,
+            queue=False,
+        )
+
+        def load_full_edit(job_id: str):
+            result = queue.begin_full_edit(job_id)
+            if not result["ok"]:
+                return [gr.update() for _ in inputs] + [gr.update(visible=True), gr.update(visible=False)]
+            return result["args"] + [gr.update(visible=False), gr.update(visible=True)]
+
+        self.full_edit_load_button.click(
+            fn=load_full_edit,
+            inputs=[self.full_edit_job_id],
+            outputs=[*inputs, self.queue_actions, self.full_edit_actions],
+            show_progress=False,
+            queue=False,
+        )
+
+        def load_reuse(job_id: str):
+            result = queue.reuse_job(job_id)
+            if not result["ok"]:
+                return [gr.update() for _ in inputs]
+            return result["args"]
+
+        self.reuse_load_button.click(
+            fn=load_reuse,
+            inputs=[self.reuse_job_id],
+            outputs=inputs,
+            show_progress=False,
+            queue=False,
+        )
+
+        def finish_full_edit(request: gr.Request, job_id: str, *args):
+            result = queue.finish_full_edit(job_id, args)
+            if result["ok"]:
+                return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
+            return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
+
+        def cancel_full_edit(job_id: str):
+            result = queue.cancel_full_edit(job_id)
+            if result["ok"]:
+                return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
+            return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
+
+        self.full_edit_update_button.click(
+            fn=finish_full_edit,
+            inputs=[self.full_edit_job_id, *inputs],
+            outputs=[self.queue_status, self.full_edit_job_id, self.queue_actions, self.full_edit_actions],
+            show_progress=False,
+            queue=False,
+        )
+        self.full_edit_cancel_button.click(
+            fn=cancel_full_edit,
+            inputs=[self.full_edit_job_id],
+            outputs=[self.queue_status, self.full_edit_job_id, self.queue_actions, self.full_edit_actions],
             show_progress=False,
             queue=False,
         )
