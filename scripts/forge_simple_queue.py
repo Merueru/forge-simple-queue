@@ -1456,14 +1456,12 @@ SIMPLE_QUEUE_ASSETS = r"""
   min-width: 0 !important;
 }
 #txt2img_simple_queue_button, #img2img_simple_queue_button,
-#txt2img_simple_queue_view, #img2img_simple_queue_view,
 #txt2img_simple_queue_button button, #img2img_simple_queue_button button,
-#txt2img_simple_queue_view button, #img2img_simple_queue_view button,
 #txt2img_simple_queue_update, #img2img_simple_queue_update,
-#txt2img_simple_queue_cancel, #img2img_simple_queue_cancel,
 #txt2img_simple_queue_update button, #img2img_simple_queue_update button,
+#txt2img_simple_queue_cancel, #img2img_simple_queue_cancel,
 #txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
-  border-radius: 14px !important;
+  border-radius: 8px !important;
 }
 .forge-simple-queue-full-edit-actions {
   width: 100%;
@@ -1482,7 +1480,6 @@ SIMPLE_QUEUE_ASSETS = r"""
 #txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
   flex: 1 1 0;
 }
-#txt2img_simple_queue_button, #img2img_simple_queue_button,
 #txt2img_simple_queue_view, #img2img_simple_queue_view,
 #txt2img_simple_queue_button button, #img2img_simple_queue_button button,
 #txt2img_simple_queue_view button, #img2img_simple_queue_view button {
@@ -1490,7 +1487,6 @@ SIMPLE_QUEUE_ASSETS = r"""
   border-color: #5b6b80 !important;
   color: #f8fafc !important;
 }
-#txt2img_simple_queue_button:hover, #img2img_simple_queue_button:hover,
 #txt2img_simple_queue_view:hover, #img2img_simple_queue_view:hover,
 #txt2img_simple_queue_button button:hover, #img2img_simple_queue_button button:hover,
 #txt2img_simple_queue_view button:hover, #img2img_simple_queue_view button:hover {
