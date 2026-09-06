@@ -100,6 +100,90 @@
   const openDetails = new Set();
 
   const activeModalTab = () => document.querySelector(".fsq-tab.fsq-active")?.dataset.tabView || "queue";
+  const fullEditLaunches = new Set();
+
+  const setGradioTextValue = (container, value) => {
+    const field = container?.querySelector("textarea, input");
+    if (!field) return false;
+    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(field), "value")?.set;
+    if (setter) setter.call(field, value);
+    else field.value = value;
+    field.dispatchEvent(new Event("input", {bubbles: true}));
+    field.dispatchEvent(new Event("change", {bubbles: true}));
+    return true;
+  };
+
+  const switchToGenerationTab = (tab) => {
+    if (tab === "img2img" && typeof switch_to_img2img === "function") {
+      switch_to_img2img();
+    } else if (tab === "txt2img" && typeof switch_to_txt2img === "function") {
+      switch_to_txt2img();
+    }
+  };
+
+  const startFullEdit = async (id, tab) => {
+    if (fullEditLaunches.has(id)) return;
+    const app = typeof gradioApp === "function" ? gradioApp() : document;
+    const field = app.getElementById(`${tab}_simple_queue_full_edit_job_id`);
+    const loader = app.getElementById(`${tab}_simple_queue_full_edit_load`);
+    if (!setGradioTextValue(field, id) || !loader) {
+      throw new Error("Full Edit controls are not available yet.");
+    }
+    fullEditLaunches.add(id);
+    loader.click();
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 160));
+      const state = await api("/forge-simple-queue/status-lite");
+      const job = [state.active, ...(state.pending || [])].find((item) => item?.id === id);
+      if (job?.editing) {
+        setTimeout(() => switchToGenerationTab(tab), 120);
+        setTimeout(() => fullEditLaunches.delete(id), 500);
+        document.getElementById("forge-simple-queue-modal")?.classList.remove("fsq-open");
+        return;
+      }
+    }
+    fullEditLaunches.delete(id);
+    throw new Error("The queued job could not enter Full Edit.");
+  };
+
+  const startReuse = async (id, tab) => {
+    const result = await api("/forge-simple-queue/reuse", {id});
+    if (!result.ok) throw new Error(result.message || "The source job settings are unavailable.");
+    const app = typeof gradioApp === "function" ? gradioApp() : document;
+    const field = app.getElementById(`${tab}_simple_queue_reuse_job_id`);
+    const loader = app.getElementById(`${tab}_simple_queue_reuse_load`);
+    if (!setGradioTextValue(field, id) || !loader) {
+      throw new Error("Reuse controls are not available yet.");
+    }
+    loader.click();
+    setTimeout(() => switchToGenerationTab(tab), 180);
+    document.getElementById("forge-simple-queue-modal")?.classList.remove("fsq-open");
+  };
+
+  const captureJobPositions = () => new Map(
+    [...document.querySelectorAll(".fsq-job[draggable='true']")].map((row) => [row.dataset.id, row.getBoundingClientRect()])
+  );
+
+  const animateReorder = (before, movedId) => {
+    for (const row of document.querySelectorAll(".fsq-job[draggable='true']")) {
+      const prior = before.get(row.dataset.id);
+      if (!prior) continue;
+      const delta = prior.top - row.getBoundingClientRect().top;
+      if (Math.abs(delta) > 1) {
+        row.style.transition = "none";
+        row.style.transform = `translateY(${delta}px)`;
+        requestAnimationFrame(() => {
+          row.style.transition = "transform 220ms ease";
+          row.style.transform = "";
+          row.addEventListener("transitionend", () => { row.style.transition = ""; }, {once: true});
+        });
+      }
+      if (row.dataset.id === movedId) {
+        row.classList.add("fsq-reordered");
+        setTimeout(() => row.classList.remove("fsq-reordered"), 900);
+      }
+    }
+  };
 
   const queueJobsFromData = (data) => [
     ...(data?.active ? [data.active] : []),
@@ -123,22 +207,34 @@
     const canRepeat = active || pending;
     const editorOpen = openEditors.has(job.id) ? " fsq-open" : "";
     const detailsOpen = openDetails.has(job.id) ? " fsq-open" : "";
-    const status = job.progress_queued && !job.progress_active ? "waiting" : job.status;
+    const status = job.editing ? "editing" : (job.progress_queued && !job.progress_active ? "waiting" : job.status);
+    const queuePosition = pending && Number.isInteger(job.index) ? `#${String(job.index + 1).padStart(2, "0")}` : "";
+    const jobCode = `Q-${String(job.id || "").toUpperCase()}`;
     const runs = Number(job.runs || 1);
     const failures = Number(job.failures || 0);
     const deleted = Number(job.deleted || 0);
     const runMeta = [runs > 1 ? `x${runs}` : "", failures ? `${failures} failed` : "", deleted ? `${deleted} deleted` : ""].filter(Boolean).join(" | ");
-    const controls = active && job.progress_active ? `
+    const utilityControls = `
+      <button class="fsq-icon-action" data-action="reuse" data-id="${job.id}" data-tab="${job.tab}" title="Reuse settings in ${job.tab}" aria-label="Reuse settings in ${job.tab}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a7 7 0 0 0-12-2L3 9m0-5v5h5M6 16a7 7 0 0 0 12 2l3-3m0 5v-5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+      </button>
+      <button class="fsq-icon-action" data-action="copy" data-id="${job.id}" title="Copy job to end of queue" aria-label="Copy job to end of queue">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>
+      </button>`;
+    const controls = job.editing ? `
+      <button data-action="details" data-id="${job.id}">Details</button>` : active && job.progress_active ? `
       <button data-action="interrupt" data-tab="${job.tab}">Stop</button>
       <button data-action="skip" data-tab="${job.tab}">Skip</button>
       <button data-action="details" data-id="${job.id}">Details</button>` : active && editable ? `
       <button data-action="${job.paused ? "resume" : "pause"}" data-id="${job.id}">${job.paused ? "Run" : "Pause"}</button>
       <button data-action="edit" data-id="${job.id}">Edit</button>
+      <button data-action="full-edit" data-id="${job.id}" data-tab="${job.tab}">Full Edit</button>
       <button data-action="details" data-id="${job.id}">Details</button>
       <button data-action="delete" data-id="${job.id}">Delete</button>` : active ? `
       <button data-action="details" data-id="${job.id}">Details</button>` : pending ? `
       <button data-action="${job.paused ? "resume" : "pause"}" data-id="${job.id}">${job.paused ? "Run" : "Pause"}</button>
       <button data-action="edit" data-id="${job.id}">Edit</button>
+      <button data-action="full-edit" data-id="${job.id}" data-tab="${job.tab}">Full Edit</button>
       <button data-action="details" data-id="${job.id}">Details</button>
       <button data-action="delete" data-id="${job.id}">Delete</button>` : `
       <button data-action="details" data-id="${job.id}">Details</button>`;
@@ -150,6 +246,7 @@
           </label>` : '<span class="fsq-repeat-spacer"></span>'}
         <button class="fsq-handle" title="Drag to reorder">::</button>
         <div>
+          ${queuePosition ? `<div class="fsq-identity"><span>${queuePosition}</span><span>${escapeHtml(jobCode)}</span></div>` : ""}
           <div class="fsq-prompt" title="${escapeHtml(prompt)}">${escapeHtml(prompt)}</div>
           <div class="fsq-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
           ${runMeta ? `<div class="fsq-meta">${escapeHtml(runMeta)}</div>` : ""}
@@ -158,6 +255,7 @@
         <div class="fsq-actions">
           <span class="fsq-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
           ${controls}
+          ${utilityControls}
         </div>
         ${editable ? `
           <div class="fsq-editor${editorOpen}" data-editor="${job.id}">
@@ -316,6 +414,38 @@
     }
   };
 
+  const setCrossTabGenerationState = (data) => {
+    const app = typeof gradioApp === "function" ? gradioApp() : document;
+    const activeTab = data?.generation_active && data?.active?.progress_active ? data.active.tab : null;
+    for (const tab of ["txt2img", "img2img"]) {
+      const generate = app.getElementById(`${tab}_generate`);
+      const queueButton = app.getElementById(`${tab}_simple_queue_button`);
+      let notice = app.getElementById(`${tab}_simple_queue_cross_tab_status`);
+      const blocked = Boolean(activeTab && tab !== activeTab);
+      if (blocked) {
+        for (const button of [generate, queueButton]) {
+          if (!button || button.dataset.fsqCrossTabDisabled) continue;
+          button.dataset.fsqCrossTabDisabled = "true";
+          button.disabled = true;
+        }
+        if (!notice) {
+          notice = document.createElement("div");
+          notice.id = `${tab}_simple_queue_cross_tab_status`;
+          notice.className = "fsq-cross-tab-status";
+          app.getElementById(`${tab}_simple_queue_box`)?.appendChild(notice);
+        }
+        if (notice) notice.textContent = `Generating in ${activeTab}…`;
+      } else {
+        for (const button of [generate, queueButton]) {
+          if (!button?.dataset.fsqCrossTabDisabled) continue;
+          delete button.dataset.fsqCrossTabDisabled;
+          button.disabled = false;
+        }
+        notice?.remove();
+      }
+    }
+  };
+
   const syncActiveGeneration = (data) => {
     const active = data?.active;
     if (active?.tab && active?.task_id) {
@@ -323,8 +453,10 @@
       setTaskStorage(active.tab, active.task_id);
       if (typeof showSubmitButtons === "function") showSubmitButtons(active.tab, false);
       followTaskProgress(active.tab, active.task_id);
+      setCrossTabGenerationState(data);
       return;
     }
+    setCrossTabGenerationState(data);
   };
 
   const showSubmitButtonsIfIdle = (tab, data = null) => {
@@ -436,6 +568,15 @@
   }
 
   let queuedStatusRefreshTimer = null;
+  const transientStatusTimers = new WeakMap();
+  const clearTransientStatus = (node) => {
+    const message = node?.textContent?.trim();
+    if (!node || !["Full edit cancelled.", "Queued job updated."].includes(message)) return;
+    clearTimeout(transientStatusTimers.get(node));
+    transientStatusTimers.set(node, setTimeout(() => {
+      if (node.textContent?.trim() === message) node.replaceChildren();
+    }, 2600));
+  };
   const scheduleQueuedStatusRefresh = () => {
     if (queuedStatusRefreshTimer) return;
     queuedStatusRefreshTimer = setTimeout(() => {
@@ -445,6 +586,9 @@
   };
 
   const scanQueuedStatus = () => {
+    for (const id of ["txt2img_simple_queue_status", "img2img_simple_queue_status"]) {
+      clearTransientStatus(document.getElementById(id));
+    }
     scheduleQueuedStatusRefresh();
   };
 
@@ -662,6 +806,11 @@
           openEditors.add(id);
         }
         document.querySelector(`[data-editor="${id}"]`)?.classList.toggle("fsq-open", openEditors.has(id));
+      } else if (action === "full-edit") {
+        openEditors.delete(id);
+        await startFullEdit(id, actionButton.dataset.tab || actionButton.closest(".fsq-job")?.dataset.tab || "txt2img");
+      } else if (action === "reuse") {
+        await startReuse(id, actionButton.dataset.tab || actionButton.closest(".fsq-job")?.dataset.tab || "txt2img");
       } else if (action === "cancel-edit") {
         openEditors.delete(id);
         await refreshQueueState({forceRender: true});
@@ -701,6 +850,11 @@
   }, true);
 
   let dragId = null;
+  let dragTarget = null;
+  const clearDragTarget = () => {
+    dragTarget?.classList.remove("fsq-drop-before", "fsq-drop-after");
+    dragTarget = null;
+  };
   document.addEventListener("dragstart", (event) => {
     const row = event.target.closest(".fsq-job[draggable='true']");
     if (!row) return;
@@ -710,12 +864,18 @@
   });
   document.addEventListener("dragend", (event) => {
     event.target.closest(".fsq-job")?.classList.remove("fsq-dragging");
+    clearDragTarget();
     dragId = null;
   });
   document.addEventListener("dragover", (event) => {
     if (!dragId) return;
     const row = event.target.closest(".fsq-job[draggable='true']");
-    if (row) event.preventDefault();
+    if (!row || row.dataset.id === dragId) return;
+    event.preventDefault();
+    clearDragTarget();
+    dragTarget = row;
+    const rect = row.getBoundingClientRect();
+    row.classList.add(event.clientY > rect.top + rect.height / 2 ? "fsq-drop-after" : "fsq-drop-before");
   });
   document.addEventListener("drop", async (event) => {
     const row = event.target.closest(".fsq-job[draggable='true']");
@@ -725,19 +885,32 @@
     const rect = row.getBoundingClientRect();
     let index = rows.indexOf(row);
     if (event.clientY > rect.top + rect.height / 2) index += 1;
+    const positions = captureJobPositions();
+    clearDragTarget();
     await api("/forge-simple-queue/move", {id: dragId, index});
-    await refreshQueueState();
+    await refreshQueueState({forceRender: true});
+    animateReorder(positions, dragId);
   });
 
   const keepQueueButtonsAlive = () => {
     for (const selector of ["#txt2img_simple_queue_button", "#img2img_simple_queue_button", "#txt2img_simple_queue_view", "#img2img_simple_queue_view"]) {
       const button = document.querySelector(selector);
       if (!button) continue;
+      if (button.dataset.fsqCrossTabDisabled) continue;
       button.disabled = false;
       button.removeAttribute("disabled");
       button.classList.remove("disabled");
       button.style.pointerEvents = "auto";
       if (selector.endsWith("_view")) button.title = "View queue";
+    }
+    for (const [selector, title] of [
+      ["#txt2img_simple_queue_update", "Update queued job"],
+      ["#img2img_simple_queue_update", "Update queued job"],
+      ["#txt2img_simple_queue_cancel", "Cancel Full Edit"],
+      ["#img2img_simple_queue_cancel", "Cancel Full Edit"]
+    ]) {
+      const button = document.querySelector(selector);
+      if (button) button.title = title;
     }
   };
 
