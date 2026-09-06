@@ -40,6 +40,12 @@ Finished jobs are shown in the History tab. History is kept bounded so long queu
 
 Use the saved queue controls to save the current queue, restore it later, or clear the saved snapshot. Saved queue data is local to your Forge installation.
 
+## Update
+
+![Save queue confirmation](images/simqimg009.png)
+
+6/9/26 - Update Queue Number, move queue animation, Repeat queue, Copy Queue, Full Edit Queue.
+
 ## Features
 
 - Queue txt2img and img2img jobs.
