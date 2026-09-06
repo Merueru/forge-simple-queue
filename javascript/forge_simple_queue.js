@@ -28,6 +28,15 @@
 
   const jobLabel = (count) => `${count} job${Number(count) === 1 ? "" : "s"}`;
 
+  const formatDuration = (seconds) => {
+    if (seconds === null || seconds === undefined || !Number.isFinite(Number(seconds)) || Number(seconds) < 0) return "";
+    const total = Number(seconds);
+    const minutes = Math.floor(total / 60);
+    const remainingSeconds = total - (minutes * 60);
+    const secondsLabel = `${remainingSeconds.toFixed(1)} sec`;
+    return minutes ? `${minutes} min ${secondsLabel}` : secondsLabel;
+  };
+
   const ensureModal = () => {
     let modal = document.getElementById("forge-simple-queue-modal");
     if (modal) return modal;
@@ -49,6 +58,11 @@
               <span class="fsq-switch"></span>
               <span>Auto repeat</span>
               <span id="forge-simple-queue-repeat-count"></span>
+            </label>
+            <label class="fsq-repeat-toggle" title="Keep queued jobs after a restart. An interrupted job returns to the top and recovery stays paused.">
+              <input id="forge-simple-queue-recovery-toggle" type="checkbox">
+              <span class="fsq-switch"></span>
+              <span>Recover</span>
             </label>
           </div>
           <div class="fsq-head-actions">
@@ -196,6 +210,19 @@
     && job.progress_active !== true
   ));
 
+  const jobActionButton = (action, id, title, icon, tab = "") => `
+    <button class="fsq-icon-action fsq-${action}" data-action="${action}" data-id="${id}" ${tab ? `data-tab="${tab}"` : ""} title="${title}" aria-label="${title}">${icon}</button>`;
+  const icon = {
+    pause: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h3v14H8zM13 5h3v14h-3z" fill="currentColor"></path></svg>`,
+    play: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" fill="currentColor"></path></svg>`,
+    edit: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.7 6.3 3 3M4 20l3.6-.8L18.4 8.4a2.1 2.1 0 0 0-3-3L4.8 16.2 4 20Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`,
+    fullEdit: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3h10l4 4v5M14 3v5h5M4 3v18h8M13.5 15.5l2.5 2.5m-5.5.5 1.8-.4 5.4-5.4a1.5 1.5 0 0 0-2.1-2.1l-5.4 5.4-.4 1.8Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>`,
+    details: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6zM15 3v4h4M9 11h6M9 15h6M9 19h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`,
+    delete: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`,
+    stop: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10H7z" fill="currentColor"></path></svg>`,
+    skip: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14l9-7zM17 5h2v14h-2z" fill="currentColor"></path></svg>`
+  };
+
   const renderJob = (job, pending, active = false) => {
     const prompt = truncate(job.prompt);
     const negative = truncate(job.negative_prompt, "");
@@ -213,7 +240,9 @@
     const runs = Number(job.runs || 1);
     const failures = Number(job.failures || 0);
     const deleted = Number(job.deleted || 0);
-    const runMeta = [runs > 1 ? `x${runs}` : "", failures ? `${failures} failed` : "", deleted ? `${deleted} deleted` : ""].filter(Boolean).join(" | ");
+    const duration = formatDuration(job.duration_seconds);
+    const durationMeta = duration ? `${runs > 1 ? "Avg time" : "Time"}: ${duration}` : "";
+    const runMeta = [runs > 1 ? `x${runs}` : "", failures ? `${failures} failed` : "", deleted ? `${deleted} deleted` : "", durationMeta].filter(Boolean).join(" | ");
     const utilityControls = `
       <button class="fsq-icon-action" data-action="reuse" data-id="${job.id}" data-tab="${job.tab}" title="Reuse settings in ${job.tab}" aria-label="Reuse settings in ${job.tab}">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a7 7 0 0 0-12-2L3 9m0-5v5h5M6 16a7 7 0 0 0 12 2l3-3m0 5v-5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
@@ -221,23 +250,21 @@
       <button class="fsq-icon-action" data-action="copy" data-id="${job.id}" title="Copy job to end of queue" aria-label="Copy job to end of queue">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>
       </button>`;
-    const controls = job.editing ? `
-      <button data-action="details" data-id="${job.id}">Details</button>` : active && job.progress_active ? `
-      <button data-action="interrupt" data-tab="${job.tab}">Stop</button>
-      <button data-action="skip" data-tab="${job.tab}">Skip</button>
-      <button data-action="details" data-id="${job.id}">Details</button>` : active && editable ? `
-      <button data-action="${job.paused ? "resume" : "pause"}" data-id="${job.id}">${job.paused ? "Run" : "Pause"}</button>
-      <button data-action="edit" data-id="${job.id}">Edit</button>
-      <button data-action="full-edit" data-id="${job.id}" data-tab="${job.tab}">Full Edit</button>
-      <button data-action="details" data-id="${job.id}">Details</button>
-      <button data-action="delete" data-id="${job.id}">Delete</button>` : active ? `
-      <button data-action="details" data-id="${job.id}">Details</button>` : pending ? `
-      <button data-action="${job.paused ? "resume" : "pause"}" data-id="${job.id}">${job.paused ? "Run" : "Pause"}</button>
-      <button data-action="edit" data-id="${job.id}">Edit</button>
-      <button data-action="full-edit" data-id="${job.id}" data-tab="${job.tab}">Full Edit</button>
-      <button data-action="details" data-id="${job.id}">Details</button>
-      <button data-action="delete" data-id="${job.id}">Delete</button>` : `
-      <button data-action="details" data-id="${job.id}">Details</button>`;
+    const controls = job.editing ? jobActionButton("details", job.id, "Details", icon.details) : active && job.progress_active ? `
+      ${jobActionButton("interrupt", job.id, "Stop generation", icon.stop, job.tab)}
+      ${jobActionButton("skip", job.id, "Skip generation", icon.skip, job.tab)}
+      ${jobActionButton("details", job.id, "Details", icon.details)}` : active && editable ? `
+      ${jobActionButton(job.paused ? "resume" : "pause", job.id, job.paused ? "Run job" : "Pause job", job.paused ? icon.play : icon.pause)}
+      ${jobActionButton("edit", job.id, "Edit prompt", icon.edit)}
+      ${jobActionButton("full-edit", job.id, "Full Edit", icon.fullEdit, job.tab)}
+      ${jobActionButton("details", job.id, "Details", icon.details)}
+      ${jobActionButton("delete", job.id, "Delete job", icon.delete)}` : active ? `
+      ${jobActionButton("details", job.id, "Details", icon.details)}` : pending ? `
+      ${jobActionButton(job.paused ? "resume" : "pause", job.id, job.paused ? "Run job" : "Pause job", job.paused ? icon.play : icon.pause)}
+      ${jobActionButton("edit", job.id, "Edit prompt", icon.edit)}
+      ${jobActionButton("full-edit", job.id, "Full Edit", icon.fullEdit, job.tab)}
+      ${jobActionButton("details", job.id, "Details", icon.details)}
+      ${jobActionButton("delete", job.id, "Delete job", icon.delete)}` : jobActionButton("details", job.id, "Details", icon.details);
     return `
       <div class="fsq-job" data-id="${job.id}" data-tab="${job.tab}" ${pending ? 'draggable="true"' : ""}>
         ${canRepeat ? `
@@ -266,7 +293,7 @@
               <button class="fsq-save fsq-cancel" data-action="cancel-edit" data-id="${job.id}">Cancel</button>
             </div>
           </div>` : ""}
-        <div class="fsq-details${detailsOpen}" data-details="${job.id}">
+        <div class="fsq-details-panel${detailsOpen}" data-details="${job.id}">
           <div><b>ID:</b> ${escapeHtml(job.id)} / ${escapeHtml(job.task_id || "")}</div>
           <div><b>Runs:</b> ${escapeHtml(runs)}${failures ? `, failed ${escapeHtml(failures)}` : ""}${deleted ? `, deleted ${escapeHtml(deleted)}` : ""}</div>
           <div><b>Forge:</b> ${escapeHtml(forgeMeta)}</div>
@@ -288,8 +315,12 @@
 
     const active = data.active ? renderJob(data.active, false, true) : "";
     const pending = (data.pending || []).map(job => renderJob(job, true)).join("");
+    const etaSeconds = data?.eta?.seconds;
+    const eta = etaSeconds !== null && etaSeconds !== undefined && Number.isFinite(Number(etaSeconds)) && Number(etaSeconds) >= 0
+      ? `<span class="fsq-eta">ETA ~ ${escapeHtml(formatDuration(etaSeconds))}</span>`
+      : "";
     body.innerHTML = `
-      ${data.active ? '<div class="fsq-section-title">Running</div>' + active : ''}
+      ${data.active ? `<div class="fsq-section-title">Running${eta}</div>` + active : ''}
       <div class="fsq-section-title">Pending (${data.pending_count || 0})</div>
       ${pending || '<div class="fsq-empty">No pending jobs.</div>'}`;
   };
@@ -297,6 +328,7 @@
   const refreshModal = async () => {
     const data = await api("/forge-simple-queue/status");
     updateRepeatControls(data);
+    updateRecoveryControls(data);
     updateQueueControls(data);
     updateSelectAllControl(data);
     updateBulkDeleteControl(data);
@@ -339,6 +371,11 @@
       const selected = Number(repeat.count || 0);
       count.textContent = selected ? `${selected} task${selected === 1 ? "" : "s"}` : "none";
     }
+  };
+
+  const updateRecoveryControls = (data) => {
+    const toggle = document.getElementById("forge-simple-queue-recovery-toggle");
+    if (toggle) toggle.checked = data?.recovery?.enabled !== false;
   };
 
   const updateQueueControls = (data) => {
@@ -479,6 +516,7 @@
     if (serial !== refreshQueueStateSerial) return data;
     updateQueueButtons(data);
     updateRepeatControls(data);
+    updateRecoveryControls(data);
     updateQueueControls(data);
     updateSelectAllControl(data);
     updateBulkDeleteControl(data);
@@ -772,10 +810,10 @@
     if (autoRepeatLabel) {
       event.preventDefault();
       event.stopPropagation();
-      const input = autoRepeatLabel.querySelector("#forge-simple-queue-repeat-toggle");
+      const input = autoRepeatLabel.querySelector("input");
       const enabled = !input.checked;
       input.checked = enabled;
-      await api("/forge-simple-queue/repeat", {enabled});
+      await api(input.id === "forge-simple-queue-recovery-toggle" ? "/forge-simple-queue/recovery" : "/forge-simple-queue/repeat", {enabled});
       await refreshQueueState();
       return;
     }
