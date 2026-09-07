@@ -44,7 +44,7 @@ Use the saved queue controls to save the current queue, restore it later, or cle
 
 ![update](images/simqimg009.png)
 
-- 6/9/26 Update Queue Number, move queue animation, Repeat queue, Copy Queue, Full Edit Queue.
+- 6/9/26 Update Queue Number, move queue animation, Reuse Queue, Copy Queue, Full Edit Queue.
 
 ![update](images/simqimg010.png)
 
