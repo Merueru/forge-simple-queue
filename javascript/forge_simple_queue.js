@@ -115,6 +115,7 @@
 
   const activeModalTab = () => document.querySelector(".fsq-tab.fsq-active")?.dataset.tabView || "queue";
   const fullEditLaunches = new Set();
+  let fullEditReturnModalTab = null;
 
   const setGradioTextValue = (container, value) => {
     const field = container?.querySelector("textarea, input");
@@ -143,6 +144,11 @@
     if (!setGradioTextValue(field, id) || !loader) {
       throw new Error("Full Edit controls are not available yet.");
     }
+    const modal = document.getElementById("forge-simple-queue-modal");
+    if (modal?.classList.contains("fsq-open")) {
+      fullEditReturnModalTab = activeModalTab();
+      modal.classList.remove("fsq-open");
+    }
     fullEditLaunches.add(id);
     loader.click();
     for (let attempt = 0; attempt < 25; attempt += 1) {
@@ -152,11 +158,13 @@
       if (job?.editing) {
         setTimeout(() => switchToGenerationTab(tab), 120);
         setTimeout(() => fullEditLaunches.delete(id), 500);
-        document.getElementById("forge-simple-queue-modal")?.classList.remove("fsq-open");
         return;
       }
     }
     fullEditLaunches.delete(id);
+    if (fullEditReturnModalTab) {
+      await restoreQueueModalAfterFullEdit();
+    }
     throw new Error("The queued job could not enter Full Edit.");
   };
 
@@ -536,6 +544,18 @@
     await refreshQueueState();
   };
 
+  const restoreQueueModalAfterFullEdit = async () => {
+    const returnTab = fullEditReturnModalTab;
+    if (!returnTab) return;
+    fullEditReturnModalTab = null;
+    await openModal();
+    if (activeModalTab() === returnTab) return;
+    document.querySelectorAll(".fsq-tab").forEach((button) => {
+      button.classList.toggle("fsq-active", button.dataset.tabView === returnTab);
+    });
+    await refreshQueueState();
+  };
+
   function followTaskProgress(tab, taskId) {
     if (!tab || !taskId || followedTasks.has(taskId)) return;
     if (typeof requestProgress !== "function") {
@@ -610,6 +630,7 @@
   const clearTransientStatus = (node) => {
     const message = node?.textContent?.trim();
     if (!node || !["Full edit cancelled.", "Queued job updated."].includes(message)) return;
+    restoreQueueModalAfterFullEdit().catch((err) => console.error("[Forge Simple Queue]", err));
     clearTimeout(transientStatusTimers.get(node));
     transientStatusTimers.set(node, setTimeout(() => {
       if (node.textContent?.trim() === message) node.replaceChildren();
