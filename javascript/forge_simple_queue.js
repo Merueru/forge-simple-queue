@@ -464,11 +464,10 @@
     const activeTab = data?.generation_active && data?.active?.progress_active ? data.active.tab : null;
     for (const tab of ["txt2img", "img2img"]) {
       const generate = app.getElementById(`${tab}_generate`);
-      const queueButton = app.getElementById(`${tab}_simple_queue_button`);
       let notice = app.getElementById(`${tab}_simple_queue_cross_tab_status`);
       const blocked = Boolean(activeTab && tab !== activeTab);
       if (blocked) {
-        for (const button of [generate, queueButton]) {
+        for (const button of [generate]) {
           if (!button || button.dataset.fsqCrossTabDisabled) continue;
           button.dataset.fsqCrossTabDisabled = "true";
           button.disabled = true;
@@ -481,7 +480,7 @@
         }
         if (notice) notice.textContent = `Generating in ${activeTab}…`;
       } else {
-        for (const button of [generate, queueButton]) {
+        for (const button of [generate]) {
           if (!button?.dataset.fsqCrossTabDisabled) continue;
           delete button.dataset.fsqCrossTabDisabled;
           button.disabled = false;
