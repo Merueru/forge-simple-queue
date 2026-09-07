@@ -530,7 +530,11 @@ class SimpleQueue:
             active_job = self._active or self._waiting
             active = self._compact_job_dict(active_job) if compact else (self._job_dict(active_job) if active_job is not None else None)
             pending_jobs = [job for job in self._pending if job is not self._waiting]
-            pending = [] if compact else [self._job_dict(job, index=i) for i, job in enumerate(pending_jobs)]
+            pending = (
+                [self._compact_job_dict(job) for job in pending_jobs]
+                if compact
+                else [self._job_dict(job, index=i) for i, job in enumerate(pending_jobs)]
+            )
             queue_count = len(pending_jobs) + (1 if self._job_counts_as_queued_locked(active_job) else 0)
             history = [] if compact else self._history_snapshot_locked()
             recent_tasks = [job.task_id for job in list(self._history)[:HISTORY_LIMIT]]
@@ -863,6 +867,7 @@ class SimpleQueue:
             "task_id": job.task_id,
             "tab": job.tab,
             "status": job.status,
+            "editing": job.editing,
             "progress_active": job.task_id == getattr(progress, "current_task", None),
             "progress_queued": job.task_id in getattr(progress, "pending_tasks", {}),
         }
@@ -1978,6 +1983,19 @@ button.fsq-queue-paused:focus {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 11px;
   font-weight: 700;
+}
+.fsq-history-latest {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border: 1px solid rgba(74, 222, 128, 0.34);
+  border-radius: 999px;
+  color: #86efac;
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 .fsq-meta {
   margin-top: 4px;
