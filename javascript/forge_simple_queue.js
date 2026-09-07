@@ -116,6 +116,7 @@
   const activeModalTab = () => document.querySelector(".fsq-tab.fsq-active")?.dataset.tabView || "queue";
   const fullEditLaunches = new Set();
   let fullEditReturnModalTab = null;
+  let fullEditRestoreArmed = false;
 
   const setGradioTextValue = (container, value) => {
     const field = container?.querySelector("textarea, input");
@@ -147,14 +148,19 @@
     const modal = document.getElementById("forge-simple-queue-modal");
     if (modal?.classList.contains("fsq-open")) {
       fullEditReturnModalTab = activeModalTab();
+      fullEditRestoreArmed = false;
       modal.classList.remove("fsq-open");
     }
     fullEditLaunches.add(id);
     loader.click();
     for (let attempt = 0; attempt < 25; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 160));
-      const state = await api("/forge-simple-queue/status-lite");
-      const job = [state.active, ...(state.pending || [])].find((item) => item?.id === id);
+      let state = await api("/forge-simple-queue/status-lite");
+      let job = [state.active, ...(state.pending || [])].find((item) => item?.id === id);
+      if (!job && Number(state.pending_count || 0) > 0) {
+        state = await api("/forge-simple-queue/status");
+        job = [state.active, ...(state.pending || [])].find((item) => item?.id === id);
+      }
       if (job?.editing) {
         setTimeout(() => switchToGenerationTab(tab), 120);
         setTimeout(() => fullEditLaunches.delete(id), 500);
@@ -163,7 +169,7 @@
     }
     fullEditLaunches.delete(id);
     if (fullEditReturnModalTab) {
-      await restoreQueueModalAfterFullEdit();
+      await restoreQueueModalAfterFullEdit(true);
     }
     throw new Error("The queued job could not enter Full Edit.");
   };
@@ -231,7 +237,7 @@
     skip: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14l9-7zM17 5h2v14h-2z" fill="currentColor"></path></svg>`
   };
 
-  const renderJob = (job, pending, active = false) => {
+  const renderJob = (job, pending, active = false, historyIndex = null) => {
     const prompt = truncate(job.prompt);
     const negative = truncate(job.negative_prompt, "");
     const summary = job.summary || {};
@@ -244,6 +250,7 @@
     const detailsOpen = openDetails.has(job.id) ? " fsq-open" : "";
     const status = job.editing ? "editing" : (job.progress_queued && !job.progress_active ? "waiting" : job.status);
     const queuePosition = pending && Number.isInteger(job.index) ? `#${String(job.index + 1).padStart(2, "0")}` : "";
+    const historyPosition = Number.isInteger(historyIndex) ? `#${String(historyIndex + 1).padStart(2, "0")}` : "";
     const jobCode = `Q-${String(job.id || "").toUpperCase()}`;
     const runs = Number(job.runs || 1);
     const failures = Number(job.failures || 0);
@@ -278,10 +285,10 @@
         ${canRepeat ? `
           <label class="fsq-repeat-check" title="Select job for repeat or bulk delete">
             <input type="checkbox" data-action="repeat-job" data-id="${job.id}" ${job.repeat_selected ? "checked" : ""}>
-          </label>` : '<span class="fsq-repeat-spacer"></span>'}
+        </label>` : '<span class="fsq-repeat-spacer"></span>'}
         <button class="fsq-handle" title="Drag to reorder">::</button>
         <div>
-          ${queuePosition ? `<div class="fsq-identity"><span>${queuePosition}</span><span>${escapeHtml(jobCode)}</span></div>` : ""}
+          ${queuePosition ? `<div class="fsq-identity"><span>${queuePosition}</span><span>${escapeHtml(jobCode)}</span></div>` : historyPosition ? `<div class="fsq-identity"><span>${historyPosition}</span>${historyIndex === 0 ? '<span class="fsq-history-latest" title="Newest history item">Latest</span>' : ""}</div>` : ""}
           <div class="fsq-prompt" title="${escapeHtml(prompt)}">${escapeHtml(prompt)}</div>
           <div class="fsq-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
           ${runMeta ? `<div class="fsq-meta">${escapeHtml(runMeta)}</div>` : ""}
@@ -316,7 +323,7 @@
     if (!body) return;
     const view = activeModalTab();
     if (view === "history") {
-      const history = (data.history || []).slice(0, 30).map(job => renderJob(job, false)).join("");
+      const history = (data.history || []).slice(0, 30).map((job, index) => renderJob(job, false, false, index)).join("");
       body.innerHTML = `${history || '<div class="fsq-empty">No history.</div>'}`;
       return;
     }
@@ -461,7 +468,9 @@
 
   const setCrossTabGenerationState = (data) => {
     const app = typeof gradioApp === "function" ? gradioApp() : document;
-    const activeTab = data?.generation_active && data?.active?.progress_active ? data.active.tab : null;
+    const activeTab = data?.generation_active && ["txt2img", "img2img"].includes(data?.active?.tab)
+      ? data.active.tab
+      : null;
     for (const tab of ["txt2img", "img2img"]) {
       const generate = app.getElementById(`${tab}_generate`);
       let notice = app.getElementById(`${tab}_simple_queue_cross_tab_status`);
@@ -543,10 +552,11 @@
     await refreshQueueState();
   };
 
-  const restoreQueueModalAfterFullEdit = async () => {
+  const restoreQueueModalAfterFullEdit = async (force = false) => {
     const returnTab = fullEditReturnModalTab;
-    if (!returnTab) return;
+    if (!returnTab || (!force && !fullEditRestoreArmed)) return;
     fullEditReturnModalTab = null;
+    fullEditRestoreArmed = false;
     await openModal();
     if (activeModalTab() === returnTab) return;
     document.querySelectorAll(".fsq-tab").forEach((button) => {
@@ -671,6 +681,12 @@
   }, {capture: true, passive: true});
 
   document.addEventListener("click", async (event) => {
+    const fullEditActionButton = event.target.closest("#txt2img_simple_queue_update, #img2img_simple_queue_update, #txt2img_simple_queue_cancel, #img2img_simple_queue_cancel");
+    if (fullEditActionButton) {
+      fullEditRestoreArmed = Boolean(fullEditReturnModalTab);
+      return;
+    }
+
     const tabButton = event.target.closest(".fsq-tab[data-tab-view]");
     if (tabButton) {
       event.preventDefault();
