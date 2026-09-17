@@ -989,6 +989,100 @@ class SimpleQueue:
             group["timed_runs"] += 1
             group["_duration_total"] += duration
 
+    @staticmethod
+    def _timing_features(job: QueueJob) -> dict[str, Any]:
+        def number(key: str) -> float | None:
+            value = job._arg_by_key(key, default=None)
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        width = number(f"{job.tab}_width")
+        height = number(f"{job.tab}_height")
+        dimensions = tuple(sorted((width, height))) if width and height else None
+        batch_count = number(f"{job.tab}_batch_count")
+        batch_size = number(f"{job.tab}_batch_size")
+        batch = batch_count * batch_size if batch_count and batch_size else None
+        return {
+            "tab": job.tab,
+            "forge": job.forge_state,
+            "steps": number(f"{job.tab}_steps"),
+            "sampler": job._arg_by_key(f"{job.tab}_sampling", default=None),
+            "schedule": job._arg_by_key(f"{job.tab}_scheduler", default=None),
+            "dimensions": dimensions,
+            "batch": batch,
+        }
+
+    @classmethod
+    def _timing_similarity_score(cls, target: dict[str, Any], candidate: dict[str, Any]) -> float | None:
+        if target["tab"] != candidate["tab"] or not forge_states_match(target["forge"], candidate["forge"]):
+            return None
+
+        score = 0.0
+        comparable = 0
+
+        target_dimensions = target["dimensions"]
+        candidate_dimensions = candidate["dimensions"]
+        if target_dimensions and candidate_dimensions:
+            comparable += 1
+            dimension_delta = max(
+                target_size / candidate_size if target_size >= candidate_size else candidate_size / target_size
+                for target_size, candidate_size in zip(target_dimensions, candidate_dimensions)
+            ) - 1.0
+            if dimension_delta > 0.4:
+                return None
+            score += 4.0 if dimension_delta <= 0.05 else 3.0 if dimension_delta <= 0.15 else 1.0
+
+        target_steps = target["steps"]
+        candidate_steps = candidate["steps"]
+        if target_steps and candidate_steps:
+            comparable += 1
+            steps_delta = abs(target_steps - candidate_steps) / max(target_steps, candidate_steps, 1.0)
+            if steps_delta > 0.5:
+                return None
+            score += 3.0 if steps_delta <= 0.1 else 2.0 if steps_delta <= 0.25 else 1.0
+
+        target_batch = target["batch"]
+        candidate_batch = candidate["batch"]
+        if target_batch and candidate_batch:
+            comparable += 1
+            batch_delta = max(target_batch, candidate_batch) / min(target_batch, candidate_batch) - 1.0
+            if batch_delta > 1.0:
+                return None
+            score += 2.0 if batch_delta <= 0.05 else 1.0
+
+        if target["sampler"] is not None and candidate["sampler"] is not None:
+            comparable += 1
+            if target["sampler"] == candidate["sampler"]:
+                score += 1.0
+        if target["schedule"] is not None and candidate["schedule"] is not None:
+            comparable += 1
+            if target["schedule"] == candidate["schedule"]:
+                score += 1.0
+
+        return score if comparable and score >= 3.0 else None
+
+    @classmethod
+    def _estimate_similar_duration_locked(
+        cls,
+        job: QueueJob,
+        history_samples: list[tuple[QueueJob, float]],
+    ) -> tuple[float | None, int]:
+        target = cls._timing_features(job)
+        ranked: list[tuple[float, float]] = []
+        for history_job, duration in history_samples:
+            score = cls._timing_similarity_score(target, cls._timing_features(history_job))
+            if score is not None:
+                ranked.append((score, duration))
+        if not ranked:
+            return None, 0
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        best_score = ranked[0][0]
+        durations = [duration for score, duration in ranked if score >= best_score - 1.0][:5]
+        return float(statistics.median(durations)), len(durations)
+
     def _estimate_remaining_locked(self, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         active_job = self._active or self._waiting
@@ -1003,11 +1097,13 @@ class SimpleQueue:
             return {"seconds": None, "sample_count": 0, "unknown_jobs": 0}
 
         samples: dict[str, list[float]] = {}
+        history_samples: list[tuple[QueueJob, float]] = []
         for job in self._history:
             duration = job.duration_seconds()
             if job.status != "done" or duration is None:
                 continue
             samples.setdefault(job.timing_profile(), []).append(duration)
+            history_samples.append((job, duration))
 
         estimates: dict[str, float] = {
             profile: float(statistics.median(durations))
@@ -1016,23 +1112,36 @@ class SimpleQueue:
         unknown_jobs = 0
         total_seconds = 0.0
         used_profiles: set[str] = set()
+        fallback_sample_count = 0
+        approximate = False
         for job in queue_jobs:
             profile = job.timing_profile()
             estimate = estimates.get(profile)
             if estimate is None:
-                unknown_jobs += 1
-                continue
-            used_profiles.add(profile)
+                estimate, fallback_count = self._estimate_similar_duration_locked(job, history_samples)
+                if estimate is None:
+                    unknown_jobs += 1
+                    continue
+                fallback_sample_count += fallback_count
+                approximate = True
+            else:
+                used_profiles.add(profile)
             if job is active_job and job is self._active and job.status == "running" and job.started_at is not None:
                 estimate = max(0.0, estimate - (now - job.started_at))
             total_seconds += estimate
 
         if unknown_jobs:
-            return {"seconds": None, "sample_count": sum(len(samples[profile]) for profile in used_profiles), "unknown_jobs": unknown_jobs}
+            return {
+                "seconds": None,
+                "sample_count": sum(len(samples[profile]) for profile in used_profiles) + fallback_sample_count,
+                "unknown_jobs": unknown_jobs,
+                "approximate": approximate,
+            }
         return {
             "seconds": round(total_seconds, 1),
-            "sample_count": sum(len(samples[profile]) for profile in used_profiles),
+            "sample_count": sum(len(samples[profile]) for profile in used_profiles) + fallback_sample_count,
             "unknown_jobs": 0,
+            "approximate": approximate,
         }
 
     def _append_history_locked(self, job: QueueJob):
