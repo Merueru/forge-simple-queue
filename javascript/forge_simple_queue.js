@@ -258,13 +258,16 @@
     const duration = formatDuration(job.duration_seconds);
     const durationMeta = duration ? `${runs > 1 ? "Avg time" : "Time"}: ${duration}` : "";
     const runMeta = [runs > 1 ? `x${runs}` : "", failures ? `${failures} failed` : "", deleted ? `${deleted} deleted` : "", durationMeta].filter(Boolean).join(" | ");
-    const utilityControls = `
+    const utilityControls = job.source === "generate" ? "" : `
       <button class="fsq-icon-action" data-action="reuse" data-id="${job.id}" data-tab="${job.tab}" title="Reuse settings in ${job.tab}" aria-label="Reuse settings in ${job.tab}">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a7 7 0 0 0-12-2L3 9m0-5v5h5M6 16a7 7 0 0 0 12 2l3-3m0 5v-5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
       </button>
       <button class="fsq-icon-action" data-action="copy" data-id="${job.id}" title="Copy job to end of queue" aria-label="Copy job to end of queue">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>
       </button>`;
+    const deleteControl = !job.editing && (pending || (active && editable && !job.progress_active))
+      ? jobActionButton("delete", job.id, "Delete job", icon.delete)
+      : "";
     const controls = job.editing ? jobActionButton("details", job.id, "Details", icon.details) : active && job.progress_active ? `
       ${jobActionButton("interrupt", job.id, "Stop generation", icon.stop, job.tab)}
       ${jobActionButton("skip", job.id, "Skip generation", icon.skip, job.tab)}
@@ -272,14 +275,12 @@
       ${jobActionButton(job.paused ? "resume" : "pause", job.id, job.paused ? "Run job" : "Pause job", job.paused ? icon.play : icon.pause)}
       ${jobActionButton("edit", job.id, "Edit prompt", icon.edit)}
       ${jobActionButton("full-edit", job.id, "Full Edit", icon.fullEdit, job.tab)}
-      ${jobActionButton("details", job.id, "Details", icon.details)}
-      ${jobActionButton("delete", job.id, "Delete job", icon.delete)}` : active ? `
+      ${jobActionButton("details", job.id, "Details", icon.details)}` : active ? `
       ${jobActionButton("details", job.id, "Details", icon.details)}` : pending ? `
       ${jobActionButton(job.paused ? "resume" : "pause", job.id, job.paused ? "Run job" : "Pause job", job.paused ? icon.play : icon.pause)}
       ${jobActionButton("edit", job.id, "Edit prompt", icon.edit)}
       ${jobActionButton("full-edit", job.id, "Full Edit", icon.fullEdit, job.tab)}
-      ${jobActionButton("details", job.id, "Details", icon.details)}
-      ${jobActionButton("delete", job.id, "Delete job", icon.delete)}` : jobActionButton("details", job.id, "Details", icon.details);
+      ${jobActionButton("details", job.id, "Details", icon.details)}` : jobActionButton("details", job.id, "Details", icon.details);
     return `
       <div class="fsq-job" data-id="${job.id}" data-tab="${job.tab}" ${pending ? 'draggable="true"' : ""}>
         ${canRepeat ? `
@@ -298,6 +299,7 @@
           <span class="fsq-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
           ${controls}
           ${utilityControls}
+          ${deleteControl}
         </div>
         ${editable ? `
           <div class="fsq-editor${editorOpen}" data-editor="${job.id}">
