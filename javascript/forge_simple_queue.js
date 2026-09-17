@@ -252,12 +252,14 @@
     const queuePosition = pending && Number.isInteger(job.index) ? `#${String(job.index + 1).padStart(2, "0")}` : "";
     const historyPosition = Number.isInteger(historyIndex) ? `#${String(historyIndex + 1).padStart(2, "0")}` : "";
     const jobCode = `Q-${String(job.id || "").toUpperCase()}`;
-    const runs = Number(job.runs || 1);
+    const runs = Number(job.runs ?? 1);
     const failures = Number(job.failures || 0);
     const deleted = Number(job.deleted || 0);
+    const skipped = Number(job.skipped || 0);
+    const interrupted = Number(job.interrupted || 0);
     const duration = formatDuration(job.duration_seconds);
     const durationMeta = duration ? `${runs > 1 ? "Avg time" : "Time"}: ${duration}` : "";
-    const runMeta = [runs > 1 ? `x${runs}` : "", failures ? `${failures} failed` : "", deleted ? `${deleted} deleted` : "", durationMeta].filter(Boolean).join(" | ");
+    const runMeta = [runs > 1 ? `x${runs}` : "", failures ? `${failures} failed` : "", deleted ? `${deleted} deleted` : "", skipped ? `${skipped} skipped` : "", interrupted ? `${interrupted} stopped` : "", durationMeta].filter(Boolean).join(" | ");
     const utilityControls = job.source === "generate" ? "" : `
       <button class="fsq-icon-action" data-action="reuse" data-id="${job.id}" data-tab="${job.tab}" title="Reuse settings in ${job.tab}" aria-label="Reuse settings in ${job.tab}">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a7 7 0 0 0-12-2L3 9m0-5v5h5M6 16a7 7 0 0 0 12 2l3-3m0 5v-5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
@@ -862,6 +864,12 @@
       if (activeTaskByTab.has(tab)) {
         api("/forge-simple-queue/control", {action: "stop"}).catch((err) => console.error("[Forge Simple Queue]", err));
       }
+      return;
+    }
+
+    const nativeSkip = event.target.closest("#txt2img_skip, #img2img_skip");
+    if (nativeSkip) {
+      api("/forge-simple-queue/skip", {}).catch((err) => console.error("[Forge Simple Queue]", err));
       return;
     }
 
