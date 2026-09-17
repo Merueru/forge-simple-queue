@@ -142,6 +142,7 @@ class QueueJob:
         username: str | None,
         repeat_id: str | None = None,
         repeat_placeholder: bool = False,
+        source: str = "queue",
     ):
         self.id = job_id
         self.task_id = task_id
@@ -152,6 +153,7 @@ class QueueJob:
         self.username = username
         self.repeat_id = repeat_id or job_id
         self.repeat_placeholder = repeat_placeholder
+        self.source = source
         self.created_at = time.time()
         self.started_at: float | None = None
         self.completed_at: float | None = None
@@ -240,6 +242,7 @@ class QueueJob:
             "repeat_id": self.repeat_id,
             "repeat_selected": repeat_selected,
             "repeat_placeholder": self.repeat_placeholder,
+            "source": self.source,
             "tab": self.tab,
             "index": index,
             "status": "paused" if self.paused and self.status == "queued" else self.status,
@@ -290,6 +293,7 @@ class QueueJob:
             self.username,
             repeat_id=self.repeat_id,
             repeat_placeholder=self.repeat_placeholder,
+            source=self.source,
         )
         history_job.created_at = self.created_at
         history_job.started_at = self.started_at
@@ -524,6 +528,77 @@ class SimpleQueue:
             f"Queued {html.escape(tab)} job {html.escape(job_id)}."
             "</div>"
         )
+
+    def _is_queue_generation(self, task_id: str | None = None) -> bool:
+        task_id = str(task_id or getattr(getattr(shared, "state", None), "job", "") or getattr(progress, "current_task", None) or "")
+        if task_id.startswith("task(simple-queue-"):
+            return True
+        with self._condition:
+            active = self._active or self._waiting
+            return active is not None and (not task_id or active.task_id == task_id)
+
+    def record_direct_generation(self, tab: str, processing: Any) -> bool:
+        if getattr(processing, "is_api", False) or getattr(processing, "txt2img_upscale", False):
+            return False
+        if getattr(processing, "_forge_simple_queue_history_recorded", False):
+            return False
+
+        task_id = str(
+            getattr(getattr(shared, "state", None), "job", "")
+            or getattr(progress, "current_task", None)
+            or f"task(generate-{uuid4().hex[:12]})"
+        )
+        if self._is_queue_generation(task_id):
+            return False
+
+        job_id = uuid4().hex[:12]
+        input_keys = [
+            "id_task",
+            f"{tab}_prompt",
+            f"{tab}_neg_prompt",
+            f"{tab}_steps",
+            f"{tab}_sampling",
+            f"{tab}_scheduler",
+            f"{tab}_width",
+            f"{tab}_height",
+            f"{tab}_batch_count",
+            f"{tab}_batch_size",
+            f"{tab}_cfg_scale",
+            f"{tab}_denoising_strength",
+        ]
+        args = [
+            task_id,
+            _copy_value(getattr(processing, "prompt", "")),
+            _copy_value(getattr(processing, "negative_prompt", "")),
+            _copy_value(getattr(processing, "steps", None)),
+            _copy_value(getattr(processing, "sampler_name", None)),
+            _copy_value(getattr(processing, "scheduler", None)),
+            _copy_value(getattr(processing, "width", None)),
+            _copy_value(getattr(processing, "height", None)),
+            _copy_value(getattr(processing, "n_iter", None)),
+            _copy_value(getattr(processing, "batch_size", None)),
+            _copy_value(getattr(processing, "cfg_scale", None)),
+            _copy_value(getattr(processing, "denoising_strength", None)),
+        ]
+        job = QueueJob(
+            job_id,
+            task_id,
+            tab,
+            args,
+            input_keys,
+            capture_forge_state(),
+            getattr(processing, "user", None),
+            source="generate",
+        )
+        started_at = getattr(processing, "_forge_simple_queue_started_at", None) or time.time()
+        job.created_at = started_at
+        job.started_at = started_at
+        job.completed_at = time.time()
+        job.status = "done"
+        with self._condition:
+            self._append_history_locked(job)
+        processing._forge_simple_queue_history_recorded = True
+        return True
 
     def snapshot(self, compact: bool = False) -> dict[str, Any]:
         with self._condition:
@@ -2137,6 +2212,15 @@ class Script(scripts.Script):
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
+
+    def before_process(self, processing, *args):
+        if not queue._is_queue_generation() and not getattr(processing, "_forge_simple_queue_started_at", None):
+            processing._forge_simple_queue_started_at = time.time()
+
+    def postprocess(self, processing, processed, *args):
+        tab = "img2img" if self.is_img2img else "txt2img"
+        if queue.record_direct_generation(tab, processing):
+            print(f"[Forge Simple Queue] Recorded direct {tab} generation in history.")
 
     def after_component(self, component, **_kwargs):
         generate_id = "img2img_generate" if self.is_img2img else "txt2img_generate"
