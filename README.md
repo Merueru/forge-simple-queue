@@ -53,6 +53,7 @@ Use the saved queue controls to save the current queue, restore it later, or cle
 ![update](images/simqimg011.png)
   
 - 18/9/26 — Move the Delete button to the far right of each queue item. Record completed generations started with the normal Generate button in Queue History.
+  - Improve ETA estimation by comparing similar recent jobs in history when generation settings do not exactly match.
 
 ## Features
 
