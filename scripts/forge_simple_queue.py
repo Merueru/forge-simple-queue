@@ -161,6 +161,7 @@ class QueueJob:
         self.paused = repeat_placeholder
         self.cancel_requested = False
         self.error: str | None = None
+        self.termination_reason: str | None = None
         self.editing = False
         self._fingerprint_cache: str | None = None
         self._prompt_snapshot: str | None = None
@@ -235,6 +236,8 @@ class QueueJob:
         runs: int = 1,
         failures: int = 0,
         deleted: int = 0,
+        skipped: int = 0,
+        interrupted: int = 0,
     ) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -261,6 +264,8 @@ class QueueJob:
             "runs": runs,
             "failures": failures,
             "deleted": deleted,
+            "skipped": skipped,
+            "interrupted": interrupted,
         }
 
     def summary(self) -> dict[str, Any]:
@@ -302,6 +307,7 @@ class QueueJob:
         history_job.paused = self.paused
         history_job.cancel_requested = self.cancel_requested
         history_job.error = self.error
+        history_job.termination_reason = self.termination_reason
         history_job._fingerprint_cache = fingerprint
         history_job._prompt_snapshot = self.prompt
         history_job._negative_prompt_snapshot = self.negative_prompt
@@ -383,6 +389,7 @@ class SimpleQueue:
         self._recovery_enabled = bool(self._recovery_snapshot.get("enabled", True)) if self._recovery_snapshot else True
         self._recovered_count = 0
         self._recovery_checkpoint_timer: threading.Timer | None = None
+        self._direct_termination_reason: str | None = None
         with self._condition:
             self._restore_recovery_payload_locked(self._recovery_snapshot)
         self._worker_started = False
@@ -495,8 +502,7 @@ class SimpleQueue:
 
         @app.post("/forge-simple-queue/skip")
         def skip():
-            shared.state.skip()
-            return self.snapshot()
+            return self.skip()
 
     def enqueue(
         self,
@@ -541,6 +547,17 @@ class SimpleQueue:
         if getattr(processing, "is_api", False) or getattr(processing, "txt2img_upscale", False):
             return False
         if getattr(processing, "_forge_simple_queue_history_recorded", False):
+            return False
+        with self._condition:
+            requested_termination = self._direct_termination_reason
+            self._direct_termination_reason = None
+        if requested_termination:
+            return False
+        state = getattr(shared, "state", None)
+        if state is not None and any(
+            getattr(state, flag, False)
+            for flag in ("interrupted", "skipped", "stopping_generation")
+        ):
             return False
 
         task_id = str(
@@ -954,19 +971,26 @@ class SimpleQueue:
             fingerprint = job.fingerprint()
             if fingerprint in by_fingerprint:
                 group = by_fingerprint[fingerprint]
-                group["runs"] += 1
+                if job.status == "done":
+                    group["runs"] += 1
                 if job.status == "failed":
                     group["failures"] += 1
                 if job.status == "deleted":
                     group["deleted"] += 1
+                if job.status == "skipped":
+                    group["skipped"] += 1
+                if job.status == "interrupted":
+                    group["interrupted"] += 1
                 self._add_history_duration(group, job)
                 continue
 
             group = self._job_dict(
                 job,
-                runs=1,
+                runs=1 if job.status == "done" else 0,
                 failures=1 if job.status == "failed" else 0,
                 deleted=1 if job.status == "deleted" else 0,
+                skipped=1 if job.status == "skipped" else 0,
+                interrupted=1 if job.status == "interrupted" else 0,
             )
             group["timed_runs"] = 0
             group["_duration_total"] = 0.0
@@ -984,6 +1008,8 @@ class SimpleQueue:
 
     @staticmethod
     def _add_history_duration(group: dict[str, Any], job: QueueJob):
+        if job.status != "done":
+            return
         duration = job.duration_seconds()
         if duration is not None:
             group["timed_runs"] += 1
@@ -1363,6 +1389,15 @@ class SimpleQueue:
             self._condition.notify_all()
         self._schedule_recovery_checkpoint()
 
+    def skip(self) -> dict[str, Any]:
+        with self._condition:
+            if self._active is not None:
+                self._active.termination_reason = "skipped"
+            elif getattr(shared.state, "job", "") or getattr(progress, "current_task", None):
+                self._direct_termination_reason = "skipped"
+        shared.state.skip()
+        return self.snapshot()
+
     def control(self, action: str) -> dict[str, Any]:
         action = (action or "").lower()
         interrupt = False
@@ -1384,6 +1419,10 @@ class SimpleQueue:
                 self._queue_mode = "pause"
                 self._repeat_enabled = False
                 interrupt = self._active is not None
+                if self._active is not None:
+                    self._active.termination_reason = "interrupted"
+                elif getattr(shared.state, "job", "") or getattr(progress, "current_task", None):
+                    self._direct_termination_reason = "interrupted"
                 self._pause_waiting_locked()
                 self._ensure_selected_placeholders_locked()
                 self._condition.notify_all()
@@ -1556,7 +1595,7 @@ class SimpleQueue:
                 self._checkpoint_recovery()
                 self._run_job_with_lock(job)
                 if job.status != "deleted":
-                    job.status = "done"
+                    job.status = job.termination_reason or "done"
             except Exception as exc:
                 job.status = "failed"
                 job.error = f"{type(exc).__name__}: {exc}"
@@ -1602,7 +1641,13 @@ class SimpleQueue:
             shared.state.begin(job=job.task_id)
             progress.start_task(job.task_id)
             try:
-                return runner(*runner_args)
+                result = runner(*runner_args)
+                if job.termination_reason is None:
+                    if shared.state.interrupted or shared.state.stopping_generation:
+                        job.termination_reason = "interrupted"
+                    elif shared.state.skipped:
+                        job.termination_reason = "skipped"
+                return result
             finally:
                 progress.finish_task(job.task_id)
                 shared.state.end()
