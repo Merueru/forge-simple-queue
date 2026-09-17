@@ -50,6 +50,10 @@ Use the saved queue controls to save the current queue, restore it later, or cle
 
 - 7/9/26 Update Recover queue, SVG button, ETA queue time, button.
 
+![update](images/simqimg011.png)
+  
+- 18/9/26 — Move the Delete button to the far right of each queue item. Record completed generations started with the normal Generate button in Queue History.
+
 ## Features
 
 - Queue txt2img and img2img jobs.
