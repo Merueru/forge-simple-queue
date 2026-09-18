@@ -54,6 +54,8 @@ Use the saved queue controls to save the current queue, restore it later, or cle
   
 - 18/9/26 — Move the Delete button to the far right of each queue item. Record completed generations started with the normal Generate button in Queue History.
   - Improve ETA estimation by comparing similar recent jobs in history when generation settings do not exactly match.
+- 19/9/26 — Updated the queue ETA calculation and fixed history matching when task IDs or prompts change. Reduced unnecessary queue UI updates.
+  - ETA is just a rough guess based on recent jobs. Take it as a casual reference, not a promise! It may be off or unavailable when there isn't enough matching history.
 
 ## Features
 
