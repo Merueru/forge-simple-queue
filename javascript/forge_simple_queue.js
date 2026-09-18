@@ -491,7 +491,8 @@
           notice.className = "fsq-cross-tab-status";
           app.getElementById(`${tab}_simple_queue_box`)?.appendChild(notice);
         }
-        if (notice) notice.textContent = `Generating in ${activeTab}…`;
+        const message = `Generating in ${activeTab}…`;
+        if (notice && notice.textContent !== message) notice.textContent = message;
       } else {
         for (const button of [generate]) {
           if (!button?.dataset.fsqCrossTabDisabled) continue;
