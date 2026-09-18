@@ -5,6 +5,7 @@ import pickle
 import hashlib
 import html
 import json
+import math
 import statistics
 import threading
 import time
@@ -227,7 +228,38 @@ class QueueJob:
             "tab": self.tab,
             "summary": self.summary(),
             "forge": stable_fingerprint_value(self.forge_state),
+            "workload": self.timing_workload(),
         }, sort_keys=True, separators=(",", ":"))
+
+    def timing_workload(self) -> dict[str, Any]:
+        def is_prompt(key: str) -> bool:
+            return key in ("prompt", "negative_prompt") or key.endswith(("_prompt", "_prompts"))
+
+        def timing_value(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {str(key): timing_value(item) for key, item in value.items()
+                        if not is_prompt(str(key))}
+            if isinstance(value, (list, tuple)):
+                return [timing_value(item) for item in value]
+            return stable_fingerprint_value(value)
+
+        def normalize(key: str | None, value: Any) -> Any:
+            if key and key.endswith("ad_tab_order") and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (TypeError, ValueError):
+                    pass
+            return timing_value(value)
+
+        # Forge's first unnamed input is the per-run task ID, not a workload setting.
+        return {
+            str(key) if key else f"unnamed_{index}": normalize(key, value)
+            for index, (key, value) in enumerate(zip(self.input_keys, self.args))
+            if not (index == 0 and not key) and not (key and is_prompt(key))
+            and (not key or key.startswith("script_") or "controlnet" in key.lower()
+            or key.startswith("hr_") or "_hr_" in key or "hires" in key
+            or key.endswith(("_hr", "_enable_hr", "_denoising_strength")))
+        }
 
     def to_dict(
         self,
@@ -597,6 +629,17 @@ class SimpleQueue:
             _copy_value(getattr(processing, "cfg_scale", None)),
             _copy_value(getattr(processing, "denoising_strength", None)),
         ]
+        if tab == "txt2img":
+            input_keys.append("txt2img_hr")
+            args.append(bool(getattr(processing, "enable_hr", False)))
+            if getattr(processing, "enable_hr", False):
+                for attribute in ("hr_scale", "hr_resize_x", "hr_resize_y", "hr_second_pass_steps",
+                                  "hr_upscaler", "hr_checkpoint_name", "hr_sampler_name", "hr_scheduler"):
+                    input_keys.append(f"{tab}_{attribute}")
+                    args.append(_copy_value(getattr(processing, attribute, None)))
+        if getattr(processing, "script_args", None):
+            input_keys.append("script_direct_args")
+            args.append(_copy_value(processing.script_args))
         job = QueueJob(
             job_id,
             task_id,
@@ -1020,7 +1063,8 @@ class SimpleQueue:
         def number(key: str) -> float | None:
             value = job._arg_by_key(key, default=None)
             try:
-                return float(value) if value is not None else None
+                result = float(value) if value is not None else None
+                return result if result is not None and math.isfinite(result) and result > 0 else None
             except (TypeError, ValueError):
                 return None
 
@@ -1038,11 +1082,20 @@ class SimpleQueue:
             "schedule": job._arg_by_key(f"{job.tab}_scheduler", default=None),
             "dimensions": dimensions,
             "batch": batch,
+            "batch_size": batch_size,
+            "workload": job.timing_workload(),
         }
 
     @classmethod
     def _timing_similarity_score(cls, target: dict[str, Any], candidate: dict[str, Any]) -> float | None:
         if target["tab"] != candidate["tab"] or not forge_states_match(target["forge"], candidate["forge"]):
+            return None
+        if target["workload"] != candidate["workload"]:
+            return None
+        if any(target[key] is None or candidate[key] is None
+               for key in ("dimensions", "steps", "batch", "batch_size", "sampler", "schedule")):
+            return None
+        if any(target[key] != candidate[key] for key in ("sampler", "schedule", "batch_size")):
             return None
 
         score = 0.0
@@ -1098,9 +1151,18 @@ class SimpleQueue:
         target = cls._timing_features(job)
         ranked: list[tuple[float, float]] = []
         for history_job, duration in history_samples:
-            score = cls._timing_similarity_score(target, cls._timing_features(history_job))
+            candidate = cls._timing_features(history_job)
+            score = cls._timing_similarity_score(target, candidate)
             if score is not None:
-                ranked.append((score, duration))
+                ratio = (target["steps"] / candidate["steps"]
+                         * math.prod(target["dimensions"]) / math.prod(candidate["dimensions"])
+                         * target["batch"] / candidate["batch"])
+                if ratio != 1.0 and any(value for key, value in target["workload"].items()
+                                        if not key.endswith("_denoising_strength")):
+                    continue
+                # Avoid extrapolating far beyond measured workloads.
+                if 0.5 <= ratio <= 2.0:
+                    ranked.append((score, duration * ratio))
         if not ranked:
             return None, 0
 
@@ -1126,9 +1188,11 @@ class SimpleQueue:
         history_samples: list[tuple[QueueJob, float]] = []
         for job in self._history:
             duration = job.duration_seconds()
-            if job.status != "done" or duration is None:
+            if job.status != "done" or duration is None or not math.isfinite(duration) or duration <= 0:
                 continue
-            samples.setdefault(job.timing_profile(), []).append(duration)
+            profile_samples = samples.setdefault(job.timing_profile(), [])
+            if len(profile_samples) < 5:
+                profile_samples.append(duration)
             history_samples.append((job, duration))
 
         estimates: dict[str, float] = {
@@ -1139,21 +1203,28 @@ class SimpleQueue:
         total_seconds = 0.0
         used_profiles: set[str] = set()
         fallback_sample_count = 0
+        fallback_estimates: dict[str, tuple[float | None, int]] = {}
         approximate = False
         for job in queue_jobs:
             profile = job.timing_profile()
             estimate = estimates.get(profile)
             if estimate is None:
-                estimate, fallback_count = self._estimate_similar_duration_locked(job, history_samples)
+                if profile not in fallback_estimates:
+                    fallback_estimates[profile] = self._estimate_similar_duration_locked(job, history_samples)
+                    fallback_sample_count += fallback_estimates[profile][1]
+                estimate, _ = fallback_estimates[profile]
                 if estimate is None:
                     unknown_jobs += 1
                     continue
-                fallback_sample_count += fallback_count
                 approximate = True
             else:
                 used_profiles.add(profile)
             if job is active_job and job is self._active and job.status == "running" and job.started_at is not None:
-                estimate = max(0.0, estimate - (now - job.started_at))
+                elapsed = max(0.0, now - job.started_at)
+                if elapsed >= estimate:
+                    unknown_jobs += 1
+                    continue
+                estimate -= elapsed
             total_seconds += estimate
 
         if unknown_jobs:
