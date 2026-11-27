@@ -67,7 +67,7 @@
           </div>
           <div class="fsq-head-actions">
             <button class="fsq-select-all" data-select-all-jobs="true" title="Select all visible jobs" aria-label="Select all visible jobs">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM7 9l3 3 7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><path d="m8 12 2.5 2.5L16 9"></path></g></svg>
             </button>
             <button class="fsq-bulk-delete" data-bulk-delete-selected="true" hidden disabled title="Delete selected queued jobs">Delete</button>
             <div class="fsq-saved-controls" role="group" aria-label="Saved queue">
@@ -104,6 +104,7 @@
     document.body.appendChild(modal);
     modal.addEventListener("click", (event) => {
       if (event.target === modal || event.target.closest?.(".fsq-close")) {
+        closeSettingsEditor?.();
         modal.classList.remove("fsq-open");
       }
     });
@@ -116,7 +117,8 @@
   const activeModalTab = () => document.querySelector(".fsq-tab.fsq-active")?.dataset.tabView || "queue";
   const fullEditLaunches = new Set();
   let fullEditReturnModalTab = null;
-  let fullEditRestoreArmed = false;
+  let fullEditReturnJobId = null;
+  let fullEditJobName = "";
 
   const setGradioTextValue = (container, value) => {
     const field = container?.querySelector("textarea, input");
@@ -137,7 +139,7 @@
     }
   };
 
-  const startFullEdit = async (id, tab) => {
+  const startFullEdit = async (id, tab, name) => {
     if (fullEditLaunches.has(id)) return;
     const app = typeof gradioApp === "function" ? gradioApp() : document;
     const field = app.getElementById(`${tab}_simple_queue_full_edit_job_id`);
@@ -148,7 +150,8 @@
     const modal = document.getElementById("forge-simple-queue-modal");
     if (modal?.classList.contains("fsq-open")) {
       fullEditReturnModalTab = activeModalTab();
-      fullEditRestoreArmed = false;
+      fullEditReturnJobId = id;
+      fullEditJobName = name;
       modal.classList.remove("fsq-open");
     }
     fullEditLaunches.add(id);
@@ -169,7 +172,7 @@
     }
     fullEditLaunches.delete(id);
     if (fullEditReturnModalTab) {
-      await restoreQueueModalAfterFullEdit(true);
+      await restoreQueueModalAfterFullEdit();
     }
     throw new Error("The queued job could not enter Full Edit.");
   };
@@ -237,21 +240,58 @@
     skip: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14l9-7zM17 5h2v14h-2z" fill="currentColor"></path></svg>`
   };
 
+  const showQueueToast = (message, ok) => {
+    const toast = document.createElement("div");
+    toast.className = ok ? "fsq-toast" : "fsq-toast fsq-toast-error";
+    toast.setAttribute("role", ok ? "status" : "alert");
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+  };
+
   const renderJob = (job, pending, active = false, historyIndex = null) => {
     const prompt = truncate(job.prompt);
     const negative = truncate(job.negative_prompt, "");
     const summary = job.summary || {};
     const forge = job.forge || {};
     const meta = [job.tab, summary.size, summary.steps ? `${summary.steps} steps` : "", summary.sampler, summary.schedule, summary.batch ? `batch ${summary.batch}` : "", job.error || ""].filter(Boolean).join(" | ");
-    const forgeMeta = [forge.preset ? `preset ${forge.preset}` : "", forge.checkpoint, forge.dtype, ...(forge.modules || [])].filter(Boolean).join(" | ");
+    const forgeMeta = [forge.preset ? `preset ${forge.preset}` : "", forge.dtype, ...(forge.modules || [])].filter(Boolean).join(" | ");
+    const field = (key, label, value, text = value) => {
+      if (value == null) return "";
+      if (!pending || job.editing) return escapeHtml(text);
+      return `<button type="button" class="fsq-job-name" data-action="settings" data-id="${job.id}" data-field="${key}" data-value="${escapeHtml(value)}" data-label="${escapeHtml(label)}" title="Edit ${escapeHtml(label)}">${escapeHtml(text)}</button>`;
+    };
+    const settingsMeta = [
+      summary.width != null && summary.height != null
+        ? `${field("width", "Width", summary.width)}x${field("height", "Height", summary.height)}`
+        : escapeHtml(summary.size || ""),
+      field("steps", "Steps", summary.steps, `${summary.steps} steps`),
+      escapeHtml(summary.sampler || ""), escapeHtml(summary.schedule || ""),
+      field("cfg", "CFG", summary.cfg, `CFG ${summary.cfg}`),
+      field("distilled_cfg", "Distilled CFG", summary.distilled_cfg, `Distilled CFG ${summary.distilled_cfg}`),
+      field("denoising", "Denoising", summary.denoising, `Denoising ${summary.denoising}`),
+      summary.batch_count != null && summary.batch_size != null
+        ? `batch ${field("batch_count", "Batch count", summary.batch_count)}x${field("batch_size", "Batch size", summary.batch_size)}`
+        : escapeHtml(summary.batch ? `batch ${summary.batch}` : "")
+    ].filter(Boolean).join(" | ");
+    const refinerMeta = [
+      summary.refiner || (pending && summary.has_refiner)
+        ? field("refiner", "Refiner", summary.refiner || "", summary.refiner || "Off")
+        : "",
+      field("refiner_switch", "Refiner switch (%)",
+        summary.refiner_switch == null ? null : Math.round(summary.refiner_switch * 1000) / 10,
+        `Switch at ${Math.round(summary.refiner_switch * 1000) / 10}%`),
+      field("refiner_cfg", "Refiner CFG", summary.refiner_cfg, summary.refiner_cfg < 1 ? "Base CFG" : `CFG ${summary.refiner_cfg}`)
+    ].filter(Boolean).join(" | ");
     const editable = Boolean(job.editable);
     const canRepeat = active || pending;
+    const hasThumbnail = historyIndex !== null && Boolean(job.thumbnail);
     const editorOpen = openEditors.has(job.id) ? " fsq-open" : "";
     const detailsOpen = openDetails.has(job.id) ? " fsq-open" : "";
     const status = job.editing ? "editing" : (job.progress_queued && !job.progress_active ? "waiting" : job.status);
     const queuePosition = pending && Number.isInteger(job.index) ? `#${String(job.index + 1).padStart(2, "0")}` : "";
     const historyPosition = Number.isInteger(historyIndex) ? `#${String(historyIndex + 1).padStart(2, "0")}` : "";
-    const jobCode = `Q-${String(job.id || "").toUpperCase()}`;
+    const name = job.name || "Unnamed job";
     const runs = Number(job.runs ?? 1);
     const failures = Number(job.failures || 0);
     const deleted = Number(job.deleted || 0);
@@ -285,13 +325,19 @@
       ${jobActionButton("details", job.id, "Details", icon.details)}` : jobActionButton("details", job.id, "Details", icon.details);
     return `
       <div class="fsq-job" data-id="${job.id}" data-tab="${job.tab}" ${pending ? 'draggable="true"' : ""}>
-        ${canRepeat ? `
+        ${hasThumbnail ? "" : canRepeat ? `
           <label class="fsq-repeat-check" title="Select job for repeat or bulk delete">
             <input type="checkbox" data-action="repeat-job" data-id="${job.id}" ${job.repeat_selected ? "checked" : ""}>
         </label>` : '<span class="fsq-repeat-spacer"></span>'}
-        <button class="fsq-handle" title="Drag to reorder">::</button>
+        ${hasThumbnail
+          ? `<img class="fsq-thumbnail" src="${escapeHtml(job.thumbnail)}" alt="" loading="lazy" decoding="async">`
+          : `<span class="fsq-handle" ${pending ? 'title="Drag to reorder"' : ""} aria-hidden="true">${pending ? "::" : ""}</span>`}
         <div>
-          ${queuePosition ? `<div class="fsq-identity"><span>${queuePosition}</span><span>${escapeHtml(jobCode)}</span></div>` : historyPosition ? `<div class="fsq-identity"><span>${historyPosition}</span>${historyIndex === 0 ? '<span class="fsq-history-latest" title="Newest history item">Latest</span>' : ""}</div>` : ""}
+          <div class="fsq-identity">
+            ${queuePosition || historyPosition ? `<span>${queuePosition || historyPosition}</span>` : ""}
+            <button type="button" class="fsq-job-name" data-action="rename" data-id="${job.id}" data-name="${escapeHtml(job.name || "")}" title="Rename job: ${escapeHtml(name)}">${escapeHtml(name)}</button>
+            ${historyIndex === 0 ? '<span class="fsq-history-latest" title="Newest history item">Latest</span>' : ""}
+          </div>
           <div class="fsq-prompt" title="${escapeHtml(prompt)}">${escapeHtml(prompt)}</div>
           <div class="fsq-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
           ${runMeta ? `<div class="fsq-meta">${escapeHtml(runMeta)}</div>` : ""}
@@ -315,32 +361,163 @@
         <div class="fsq-details-panel${detailsOpen}" data-details="${job.id}">
           <div><b>ID:</b> ${escapeHtml(job.id)} / ${escapeHtml(job.task_id || "")}</div>
           <div><b>Runs:</b> ${escapeHtml(runs)}${failures ? `, failed ${escapeHtml(failures)}` : ""}${deleted ? `, deleted ${escapeHtml(deleted)}` : ""}</div>
-          <div><b>Forge:</b> ${escapeHtml(forgeMeta)}</div>
+          ${forge.checkpoint ? `<div><b>Checkpoint:</b> ${field("checkpoint", "Checkpoint", forge.checkpoint)}</div>` : ""}
+          ${refinerMeta ? `<div><b>Refiner:</b> ${refinerMeta}</div>` : ""}
+          ${settingsMeta ? `<div><b>Generation:</b> ${settingsMeta}</div>` : ""}
+          ${forgeMeta ? `<div><b>Forge:</b> ${escapeHtml(forgeMeta)}</div>` : ""}
           <div><b>Prompt:</b> ${escapeHtml(job.prompt || "")}</div>
           <div><b>Negative:</b> ${escapeHtml(job.negative_prompt || "")}</div>
         </div>
       </div>`;
   };
 
+  let dragId = null;
+  let editingName = false;
+  let closeSettingsEditor = null;
+  let historyMarkup = null;
+
+  const editQueueSetting = async (button) => {
+    closeSettingsEditor?.();
+    const {id, field, label, value} = button.dataset;
+    const modelField = field === "checkpoint" || field === "refiner";
+    const editor = document.createElement("span");
+    editor.className = "fsq-settings-editor";
+    const bounds = button.getBoundingClientRect();
+    editor.style.width = `${bounds.width}px`;
+    editor.style.height = `${bounds.height}px`;
+    const input = document.createElement("input");
+    input.type = modelField ? "search" : "number";
+    input.setAttribute("aria-label", label);
+    input.step = "any";
+    input.value = value;
+    input.placeholder = modelField ? `Search ${label.toLowerCase()}` : "";
+    editor.append(input);
+
+    let saving = false;
+    const close = () => {
+      if (closeSettingsEditor !== close) return;
+      editor.replaceWith(button);
+      closeSettingsEditor = null;
+    };
+    closeSettingsEditor = close;
+    button.replaceWith(editor);
+
+    const save = async (nextValue) => {
+      if (saving || closeSettingsEditor !== close) return;
+      if (String(nextValue) === value) {
+        close();
+        return;
+      }
+      saving = true;
+      const next = field === "refiner_switch" ? nextValue / 100 : nextValue;
+      try {
+        const result = await api("/forge-simple-queue/settings", {id, [field]: next});
+        if (!result.ok) throw new Error(result.message);
+        showQueueToast(result.message, true);
+      } catch (err) {
+        showQueueToast(err.message || "Could not update queued settings.", false);
+      } finally {
+        close();
+        refreshQueueState({forceRender: true}).catch(console.error);
+      }
+    };
+
+    editor.addEventListener("keydown", (event) => {
+      if (event.isComposing) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+        button.focus();
+      } else if (event.key === "Enter" && event.target === input) {
+        event.preventDefault();
+        if (modelField) editor.querySelector(".fsq-model-choice")?.click();
+        else input.blur();
+      } else if (event.key === "ArrowDown" && modelField && event.target === input) {
+        event.preventDefault();
+        editor.querySelector(".fsq-model-choice")?.focus();
+      }
+    });
+    editor.addEventListener("focusout", (event) => {
+      if (editor.contains(event.relatedTarget) || saving || closeSettingsEditor !== close) return;
+      if (modelField || !input.value) close();
+      else save(input.valueAsNumber);
+    });
+    input.focus({preventScroll: true});
+    input.select();
+    if (!modelField) return;
+
+    try {
+      const models = await api("/forge-simple-queue/checkpoints");
+      if (closeSettingsEditor !== close) return;
+      const list = document.createElement("span");
+      list.className = "fsq-model-choices";
+      editor.append(list);
+      const bodyBounds = editor.closest(".fsq-body").getBoundingClientRect();
+      const inputBounds = input.getBoundingClientRect();
+      const above = inputBounds.top - bodyBounds.top;
+      const below = bodyBounds.bottom - inputBounds.bottom;
+      const openAbove = below < 132 && above > below;
+      list.classList.toggle("fsq-model-choices-above", openAbove);
+      list.style.maxHeight = `${Math.max(24, Math.min(128, (openAbove ? above : below) - 4))}px`;
+
+      const choices = [...new Set([value, ...(field === "refiner" ? [""] : []), ...models])];
+      const filter = (text = "") => {
+        const query = text.trim().toLowerCase();
+        list.replaceChildren();
+        for (const model of choices) {
+          const text = model || "Off";
+          if (!text.toLowerCase().includes(query)) continue;
+          const option = document.createElement("button");
+          option.type = "button";
+          option.className = "fsq-job-name fsq-model-choice";
+          option.textContent = text;
+          option.title = text;
+          option.addEventListener("click", () => save(model));
+          list.append(option);
+        }
+        if (!list.childElementCount) list.textContent = "No matching models";
+      };
+      input.addEventListener("input", () => filter(input.value));
+      filter();
+    } catch (err) {
+      close();
+      showQueueToast(err.message || "Could not load models.", false);
+    }
+  };
+
   const renderModal = (data) => {
+    if (dragId || editingName || closeSettingsEditor) return;
     const body = document.getElementById("forge-simple-queue-body");
     if (!body) return;
     const view = activeModalTab();
     if (view === "history") {
       const history = (data.history || []).slice(0, 30).map((job, index) => renderJob(job, false, false, index)).join("");
-      body.innerHTML = `${history || '<div class="fsq-empty">No history.</div>'}`;
+      const markup = history || '<div class="fsq-empty">No history.</div>';
+      if (markup !== historyMarkup) {
+        body.innerHTML = markup;
+        historyMarkup = markup;
+      }
       return;
     }
 
+    historyMarkup = null;
     const active = data.active ? renderJob(data.active, false, true) : "";
     const pending = (data.pending || []).map(job => renderJob(job, true)).join("");
-    const etaSeconds = data?.eta?.seconds;
-    const eta = etaSeconds !== null && etaSeconds !== undefined && Number.isFinite(Number(etaSeconds)) && Number(etaSeconds) >= 0
-      ? `<span class="fsq-eta">ETA ~ ${escapeHtml(formatDuration(etaSeconds))}</span>`
-      : "";
+    const etaSeconds = data?.eta?.seconds ?? data?.eta?.known_seconds;
+    const unknownJobs = Number(data?.eta?.unknown_jobs || 0);
+    const etaText = Number.isFinite(etaSeconds)
+      ? `ETA ~ ${formatDuration(etaSeconds)}${unknownJobs ? "+" : ""}`
+      : unknownJobs ? "ETA -" : "";
+    const etaHint = data?.eta?.overdue ? "The running job has exceeded its estimate."
+      : data?.eta?.stage === "preparing" ? "Estimate excludes time remaining in model preparation."
+      : unknownJobs ? "Some jobs have no estimate."
+      : data?.eta?.live ? "Estimate uses the current sampling speed."
+      : data?.eta?.rough ? "Estimate based on less similar jobs." : "";
+    const eta = etaText ? `<span class="fsq-eta"${etaHint ? ` title="${escapeHtml(etaHint)}"` : ""}>${escapeHtml(etaText)}</span>` : "";
     body.innerHTML = `
       ${data.active ? `<div class="fsq-section-title">Running${eta}</div>` + active : ''}
-      <div class="fsq-section-title">Pending (${data.pending_count || 0})</div>
+      <div class="fsq-section-title">Pending (${data.pending_count || 0})${data.active ? "" : eta}</div>
       ${pending || '<div class="fsq-empty">No pending jobs.</div>'}`;
   };
 
@@ -557,11 +734,12 @@
     await refreshQueueState();
   };
 
-  const restoreQueueModalAfterFullEdit = async (force = false) => {
+  const restoreQueueModalAfterFullEdit = async () => {
     const returnTab = fullEditReturnModalTab;
-    if (!returnTab || (!force && !fullEditRestoreArmed)) return;
+    if (!returnTab) return;
     fullEditReturnModalTab = null;
-    fullEditRestoreArmed = false;
+    fullEditReturnJobId = null;
+    fullEditJobName = "";
     await openModal();
     if (activeModalTab() === returnTab) return;
     document.querySelectorAll(".fsq-tab").forEach((button) => {
@@ -642,13 +820,14 @@
   let queuedStatusRefreshTimer = null;
   const transientStatusTimers = new WeakMap();
   const clearTransientStatus = (node) => {
-    const message = node?.textContent?.trim();
-    if (!node || !["Full edit cancelled.", "Queued job updated."].includes(message)) return;
-    restoreQueueModalAfterFullEdit().catch((err) => console.error("[Forge Simple Queue]", err));
-    clearTimeout(transientStatusTimers.get(node));
-    transientStatusTimers.set(node, setTimeout(() => {
-      if (node.textContent?.trim() === message) node.replaceChildren();
-    }, 2600));
+    const marker = node?.querySelector?.("[data-fsq-full-edit-job]");
+    if (!marker || transientStatusTimers.has(marker)) return;
+    const name = marker.dataset.fsqFullEditJob === fullEditReturnJobId ? fullEditJobName : "";
+    showQueueToast(name ? `${name}: ${marker.textContent}` : marker.textContent, marker.dataset.fsqOk === "1");
+    if (marker.dataset.fsqClose === "1" && marker.dataset.fsqFullEditJob === fullEditReturnJobId) {
+      restoreQueueModalAfterFullEdit().catch((err) => console.error("[Forge Simple Queue]", err));
+    }
+    transientStatusTimers.set(marker, setTimeout(() => marker.remove(), 2600));
   };
   const scheduleQueuedStatusRefresh = () => {
     if (queuedStatusRefreshTimer) return;
@@ -659,17 +838,20 @@
   };
 
   const scanQueuedStatus = () => {
+    const app = typeof gradioApp === "function" ? gradioApp() : document;
     for (const id of ["txt2img_simple_queue_status", "img2img_simple_queue_status"]) {
-      clearTransientStatus(document.getElementById(id));
+      clearTransientStatus(app.getElementById(id));
     }
     scheduleQueuedStatusRefresh();
   };
 
   const statusObserver = new MutationObserver(scanQueuedStatus);
   const startStatusObserver = () => {
+    const app = typeof gradioApp === "function" ? gradioApp() : document;
     let attached = false;
     for (const id of ["txt2img_simple_queue_status", "img2img_simple_queue_status"]) {
-      const node = document.getElementById(id);
+      const node = app.getElementById(id);
+      clearTransientStatus(node);
       if (node && !node.dataset.fsqObserved) {
         node.dataset.fsqObserved = "true";
         statusObserver.observe(node, {childList: true, subtree: true});
@@ -686,16 +868,11 @@
   }, {capture: true, passive: true});
 
   document.addEventListener("click", async (event) => {
-    const fullEditActionButton = event.target.closest("#txt2img_simple_queue_update, #img2img_simple_queue_update, #txt2img_simple_queue_cancel, #img2img_simple_queue_cancel");
-    if (fullEditActionButton) {
-      fullEditRestoreArmed = Boolean(fullEditReturnModalTab);
-      return;
-    }
-
     const tabButton = event.target.closest(".fsq-tab[data-tab-view]");
     if (tabButton) {
       event.preventDefault();
       event.stopPropagation();
+      closeSettingsEditor?.();
       document.querySelectorAll(".fsq-tab").forEach((button) => button.classList.toggle("fsq-active", button === tabButton));
       await refreshQueueState();
       return;
@@ -884,6 +1061,43 @@
       if (action === "repeat-job") {
         await api("/forge-simple-queue/repeat", {id, selected: actionButton.checked});
         await refreshQueueState();
+      } else if (action === "rename" && !editingName) {
+        editingName = true;
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "fsq-name-input";
+        input.setAttribute("aria-label", "Job name");
+        input.maxLength = 60;
+        input.value = actionButton.dataset.name;
+        input.addEventListener("keydown", (event) => {
+          if (event.isComposing || !["Enter", "Escape"].includes(event.key)) return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (event.key === "Escape") input.value = actionButton.dataset.name;
+          input.blur();
+        });
+        input.addEventListener("blur", async () => {
+          const name = input.value.trim();
+          try {
+            if (name && name !== actionButton.dataset.name) {
+              const result = await api("/forge-simple-queue/rename", {id, name});
+              if (!result.ok) throw new Error(result.message);
+              actionButton.textContent = result.name;
+              actionButton.dataset.name = result.name;
+              actionButton.title = `Rename job: ${result.name}`;
+            }
+          } catch (err) {
+            console.error("[Forge Simple Queue]", err);
+          } finally {
+            input.replaceWith(actionButton);
+            editingName = false;
+          }
+        }, {once: true});
+        actionButton.replaceWith(input);
+        input.focus();
+        input.select();
+      } else if (action === "settings") {
+        await editQueueSetting(actionButton);
       } else if (action === "edit") {
         if (openEditors.has(id)) {
           openEditors.delete(id);
@@ -893,7 +1107,8 @@
         document.querySelector(`[data-editor="${id}"]`)?.classList.toggle("fsq-open", openEditors.has(id));
       } else if (action === "full-edit") {
         openEditors.delete(id);
-        await startFullEdit(id, actionButton.dataset.tab || actionButton.closest(".fsq-job")?.dataset.tab || "txt2img");
+        const row = actionButton.closest(".fsq-job");
+        await startFullEdit(id, actionButton.dataset.tab || row?.dataset.tab || "txt2img", row?.querySelector('[data-action="rename"]')?.textContent?.trim());
       } else if (action === "reuse") {
         await startReuse(id, actionButton.dataset.tab || actionButton.closest(".fsq-job")?.dataset.tab || "txt2img");
       } else if (action === "cancel-edit") {
@@ -934,7 +1149,6 @@
     }
   }, true);
 
-  let dragId = null;
   let dragTarget = null;
   const clearDragTarget = () => {
     dragTarget?.classList.remove("fsq-drop-before", "fsq-drop-after");
@@ -942,7 +1156,7 @@
   };
   document.addEventListener("dragstart", (event) => {
     const row = event.target.closest(".fsq-job[draggable='true']");
-    if (!row) return;
+    if (!row || editingName || closeSettingsEditor) return;
     dragId = row.dataset.id;
     row.classList.add("fsq-dragging");
     event.dataTransfer.effectAllowed = "move";
@@ -966,15 +1180,19 @@
     const row = event.target.closest(".fsq-job[draggable='true']");
     if (!row || !dragId || row.dataset.id === dragId) return;
     event.preventDefault();
-    const rows = [...document.querySelectorAll(".fsq-job[draggable='true']")];
+    const movedId = dragId;
     const rect = row.getBoundingClientRect();
-    let index = rows.indexOf(row);
-    if (event.clientY > rect.top + rect.height / 2) index += 1;
+    const after = event.clientY > rect.top + rect.height / 2;
     const positions = captureJobPositions();
     clearDragTarget();
-    await api("/forge-simple-queue/move", {id: dragId, index});
-    await refreshQueueState({forceRender: true});
-    animateReorder(positions, dragId);
+    try {
+      await api("/forge-simple-queue/move", {id: movedId, target_id: row.dataset.id, after});
+    } catch (err) {
+      console.error("[Forge Simple Queue]", err);
+    } finally {
+      await refreshQueueState({forceRender: true});
+    }
+    animateReorder(positions, movedId);
   });
 
   const keepQueueButtonsAlive = () => {
@@ -1007,7 +1225,7 @@
     const modalOpen = Boolean(modal?.classList.contains("fsq-open"));
     const active = Boolean(data?.generation_active || data?.active);
     const queueCount = Number(data?.queue_count ?? data?.pending_count ?? 0);
-    if (modalOpen) return active ? 3000 : 1500;
+    if (modalOpen) return data?.eta?.live_enabled ? 1000 : active ? 3000 : 1500;
     if (document.hidden) return active || queueCount > 0 ? 5000 : 12000;
     if (active || queueCount > 0) return 2500;
     return 8000;
