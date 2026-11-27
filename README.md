@@ -56,6 +56,23 @@ Use the saved queue controls to save the current queue, restore it later, or cle
   - Improve ETA estimation by comparing similar recent jobs in history when generation settings do not exactly match.
 - 19/9/26 — Updated the queue ETA calculation and fixed history matching when task IDs or prompts change. Reduced unnecessary queue UI updates.
   - ETA is just a rough guess based on recent jobs. Take it as a casual reference, not a promise! It may be off or unavailable when there isn't enough matching history.
+ 
+**27/11/26**
+ 
+![update](images/simqimg012.png)
+![update](images/simqimg013.png)
+![update](images/simqimg014.png)
+![update](images/simqimg015.png)
+
+
+- Click a job name to rename it. Edit the Checkpoint, Refiner, and generation values directly in Queue Details, with searchable model pickers.
+- Full Edit restores the generation page after Update or Cancel. Notifications include the job name.
+
+![update](images/simqimg016.png)
+
+- History shows a small preview from the latest successful run in each stack. Jobs still stack by generation settings.
+- Added saved ETA statistics and live ETA updates for supported txt2img and img2img jobs, including mixed queues. (better ETA)
+- Fixed drag-and-drop ordering and base Checkpoint capture when adding a job while the Refiner is loading.
 
 ## Features
 
@@ -81,7 +98,7 @@ Restart Forge or reload the WebUI after installation.
 
 ## Notes
 
-- Pending jobs are stored in memory and are cleared when Forge restarts.
+- When Recover is enabled, the queue is restored in a paused state after Forge restarts.
 - Active jobs cannot be edited after sampling starts.
 - Result restore depends on Forge's progress / restore-progress behavior.
 - Compatibility can vary between Forge and Forge Neo builds because this extension uses internal WebUI APIs.
