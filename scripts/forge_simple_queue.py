@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import copy
 import pickle
+import re
 import hashlib
 import html
+from io import BytesIO
 import json
 import math
 import statistics
@@ -17,11 +19,16 @@ from uuid import uuid4
 
 from fastapi import Body, FastAPI
 import gradio as gr
+from gradio.context import get_blocks_context
 
 from modules import call_queue, img2img, progress, script_callbacks, scripts, shared, txt2img
 
 
 HISTORY_LIMIT = 30
+THUMBNAIL_SIZE = 96
+ETA_FILE_LIMIT = 1_000_000
+ETA_SAMPLES_PER_PROFILE = 10
+
 
 FORGE_STATE_KEYS = (
     "forge_preset",
@@ -60,11 +67,17 @@ def summarize_forge_state(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def forge_states_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    for key in set(left) | set(right):
-        if left.get(key) != right.get(key):
-            return False
-    return True
+def loaded_model_signature() -> str | None:
+    try:
+        from modules.sd_models import model_data
+    except ImportError:
+        return None
+    return model_data.forge_hash
+
+
+def timing_digest(value: Any) -> str:
+    serialized = json.dumps(stable_fingerprint_value(value), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("ascii")).hexdigest()[:32]
 
 
 def apply_forge_state(state: dict[str, Any]):
@@ -144,6 +157,7 @@ class QueueJob:
         repeat_id: str | None = None,
         repeat_placeholder: bool = False,
         source: str = "queue",
+        name: str = "",
     ):
         self.id = job_id
         self.task_id = task_id
@@ -155,8 +169,16 @@ class QueueJob:
         self.repeat_id = repeat_id or job_id
         self.repeat_placeholder = repeat_placeholder
         self.source = source
+        self.name = name
+        self.thumbnail: bytes | None = None
         self.created_at = time.time()
         self.started_at: float | None = None
+        self.generation_started_at: float | None = None
+        self.tracks_generation_stage = False
+        self.eta_load_state: str | None = None
+        self.live_eta_enabled = False
+        self.live_eta_steps: int | None = None
+        self.live_eta_observations: deque[tuple[int, float]] = deque(maxlen=5)
         self.completed_at: float | None = None
         self.status = "queued"
         self.paused = repeat_placeholder
@@ -223,13 +245,53 @@ class QueueJob:
             return None
         return max(0.0, self.completed_at - self.started_at)
 
+    def supports_live_eta(self, processing: Any) -> bool:
+        if self.tab == "img2img":
+            # Forge sends the tab mode after the task ID and the resize mode
+            # selector immediately before height. Older saved jobs use this layout too.
+            if "img2img_height" not in self.input_keys:
+                return False
+            height_index = self.input_keys.index("img2img_height")
+            if height_index <= 1 or len(self.args) <= height_index or self.args[1] != 0 or self.args[height_index - 1] != 0:
+                return False
+        elif self.tab != "txt2img":
+            return False
+        return (
+            getattr(processing, "n_iter", None) == 1
+            and getattr(processing, "batch_size", None) == 1
+            and not getattr(processing, "enable_hr", False)
+            and getattr(processing, "refiner_checkpoint", None) in (None, "", "None", "none")
+            and not any(value for key, value in zip(self.input_keys, self.args)
+                        if key and key.endswith("ad_main_accordion-checkbox"))
+        )
+
+    def eta_duration_seconds(self) -> float | None:
+        if self.generation_started_at is not None and self.completed_at is not None:
+            return max(0.0, self.completed_at - self.generation_started_at)
+        return self.duration_seconds()
+
+    def eta_sample_profile(self) -> str:
+        profile = self.timing_profile()
+        if self.generation_started_at is None:
+            return profile
+        state = self.eta_load_state
+        return f"{profile}:generation:{state}" if state else f"{profile}:generation"
+
     def timing_profile(self) -> str:
-        return json.dumps({
+        loras = re.findall(r"<lora:([^>]+)>", self.prompt, flags=re.IGNORECASE)
+        if self._arg_by_key("txt2img_hr-checkbox", "txt2img_hr", "txt2img_enable_hr"):
+            hires_prompt = self._string_value("hires_prompt", "txt2img_hr_prompt")
+            hires_loras = re.findall(r"<lora:([^>]+)>", hires_prompt, flags=re.IGNORECASE)
+        else:
+            hires_loras = []
+        return timing_digest({
             "tab": self.tab,
             "summary": self.summary(),
-            "forge": stable_fingerprint_value(self.forge_state),
+            "forge": self.forge_state,
             "workload": self.timing_workload(),
-        }, sort_keys=True, separators=(",", ":"))
+            "loras": sorted(loras),
+            "hires_loras": sorted(hires_loras),
+        })
 
     def timing_workload(self) -> dict[str, Any]:
         def is_prompt(key: str) -> bool:
@@ -251,15 +313,24 @@ class QueueJob:
                     pass
             return timing_value(value)
 
+        hires = self._arg_by_key("txt2img_hr-checkbox", "txt2img_hr", "txt2img_enable_hr")
+        refiner = self._arg_by_key(f"{self.tab}_checkpoint")
+
+        def is_hires(key: str) -> bool:
+            return key.startswith("hr_") or "_hr_" in key or "hires" in key or key.endswith(("_hr", "_hr-checkbox", "_enable_hr"))
+
         # Forge's first unnamed input is the per-run task ID, not a workload setting.
-        return {
+        workload = {
             str(key) if key else f"unnamed_{index}": normalize(key, value)
             for index, (key, value) in enumerate(zip(self.input_keys, self.args))
             if not (index == 0 and not key) and not (key and is_prompt(key))
             and (not key or key.startswith("script_") or "controlnet" in key.lower()
-            or key.startswith("hr_") or "_hr_" in key or "hires" in key
-            or key.endswith(("_hr", "_enable_hr", "_denoising_strength")))
+            or is_hires(key) or key.endswith("_denoising_strength"))
+            and not (hires is False and key and (is_hires(key) or key == "txt2img_denoising_strength"))
         }
+        if self._arg_by_key(f"{self.tab}_enable-checkbox") and refiner not in (None, "", "None", "none"):
+            workload["refiner"] = [refiner, self._arg_by_key(f"{self.tab}_switch_at"), self._arg_by_key(f"{self.tab}_cfg")]
+        return workload
 
     def to_dict(
         self,
@@ -278,6 +349,7 @@ class QueueJob:
             "repeat_selected": repeat_selected,
             "repeat_placeholder": self.repeat_placeholder,
             "source": self.source,
+            "name": self.name,
             "tab": self.tab,
             "index": index,
             "status": "paused" if self.paused and self.status == "queued" else self.status,
@@ -308,7 +380,21 @@ class QueueJob:
             height = self._arg_by_key(f"{self.tab}_height")
             batch_count = self._arg_by_key(f"{self.tab}_batch_count")
             batch_size = self._arg_by_key(f"{self.tab}_batch_size")
+            refiner = self._arg_by_key(f"{self.tab}_checkpoint")
+            if not self._arg_by_key(f"{self.tab}_enable-checkbox") or refiner in (None, "", "None", "none"):
+                refiner = None
             return {
+                "width": width,
+                "height": height,
+                "batch_count": batch_count,
+                "batch_size": batch_size,
+                "has_refiner": all(f"{self.tab}_{suffix}" in self.input_keys for suffix in ("enable-checkbox", "checkpoint")),
+                "cfg": self._arg_by_key(f"{self.tab}_cfg_scale"),
+                "distilled_cfg": self._arg_by_key(f"{self.tab}_distilled_cfg_scale"),
+                "denoising": self._arg_by_key(f"{self.tab}_denoising_strength") if self.tab == "img2img" else None,
+                "refiner": refiner,
+                "refiner_switch": self._arg_by_key(f"{self.tab}_switch_at") if refiner else None,
+                "refiner_cfg": self._arg_by_key(f"{self.tab}_cfg") if refiner else None,
                 "steps": self._arg_by_key(f"{self.tab}_steps"),
                 "sampler": self._arg_by_key(f"{self.tab}_sampling"),
                 "schedule": self._arg_by_key(f"{self.tab}_scheduler"),
@@ -331,9 +417,13 @@ class QueueJob:
             repeat_id=self.repeat_id,
             repeat_placeholder=self.repeat_placeholder,
             source=self.source,
+            name=self.name,
         )
+        history_job.thumbnail = self.thumbnail if self.status == "done" else None
         history_job.created_at = self.created_at
         history_job.started_at = self.started_at
+        history_job.generation_started_at = self.generation_started_at
+        history_job.eta_load_state = self.eta_load_state
         history_job.completed_at = self.completed_at
         history_job.status = self.status
         history_job.paused = self.paused
@@ -362,6 +452,7 @@ class QueueJob:
             self.username,
             repeat_id=self.repeat_id,
             repeat_placeholder=repeat_placeholder,
+            name=self.name,
         )
 
     def clone_as_copy(self) -> "QueueJob":
@@ -406,6 +497,9 @@ class SimpleQueue:
         self._condition = threading.Condition()
         self._pending: deque[QueueJob] = deque()
         self._history: deque[QueueJob] = deque(maxlen=HISTORY_LIMIT)
+        self._eta_path = Path(__file__).resolve().parent.parent / "data" / "eta_timings.json"
+        self._eta_timings = self._load_eta_timings()
+        self._eta_fallback_cache: dict[tuple[str, str | None], tuple[float | None, int, bool]] = {}
         self._active: QueueJob | None = None
         self._waiting: QueueJob | None = None
         self._queue_paused = False
@@ -469,7 +563,34 @@ class SimpleQueue:
 
         @app.post("/forge-simple-queue/move")
         def move(payload: dict[str, Any] = Body(default={})):
-            return self.move(str(payload.get("id", "")), int(payload.get("index", 0)))
+            return self.move(
+                str(payload.get("id", "")),
+                int(payload.get("index", 0)),
+                target_id=payload.get("target_id"),
+                after=payload.get("after") is True,
+            )
+
+        @app.get("/forge-simple-queue/thumbnail/{job_id}")
+        def thumbnail(job_id: str):
+            from fastapi import HTTPException, Response
+
+            with self._condition:
+                data = next((job.thumbnail for job in self._history if job.id == job_id), None)
+            if not data:
+                raise HTTPException(status_code=404)
+            return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+        @app.get("/forge-simple-queue/checkpoints")
+        def checkpoints():
+            return shared.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
+
+        @app.post("/forge-simple-queue/settings")
+        def settings(payload: dict[str, Any] = Body(default={})):
+            return self.update_settings(str(payload.get("id", "")), payload)
+
+        @app.post("/forge-simple-queue/rename")
+        def rename(payload: dict[str, Any] = Body(default={})):
+            return self.rename_job(str(payload.get("id", "")), payload.get("name"))
 
         @app.post("/forge-simple-queue/update")
         def update(payload: dict[str, Any] = Body(default={})):
@@ -542,6 +663,8 @@ class SimpleQueue:
         request: gr.Request | None,
         raw_args: tuple[Any, ...],
         input_keys: list[str | None],
+        *,
+        checkpoint: str | None = None,
     ) -> str:
         if len(raw_args) != len(input_keys):
             print(f"[Forge Simple Queue] Trimmed captured args from {len(raw_args)} to {len(input_keys)} inputs.")
@@ -553,9 +676,13 @@ class SimpleQueue:
         task_id = f"task(simple-queue-{job_id})"
         args[0] = task_id
         username = getattr(request, "username", None)
-        job = QueueJob(job_id, task_id, tab, args, input_keys, capture_forge_state(), username)
+        forge_state = capture_forge_state()
+        if checkpoint:
+            forge_state["sd_model_checkpoint"] = checkpoint
+        job = QueueJob(job_id, task_id, tab, args, input_keys, forge_state, username)
 
         with self._condition:
+            job.name = self._default_job_name_locked(job)
             self._pending.append(job)
             self._condition.notify_all()
         self._schedule_recovery_checkpoint()
@@ -575,7 +702,26 @@ class SimpleQueue:
             active = self._active or self._waiting
             return active is not None and (not task_id or active.task_id == task_id)
 
-    def record_direct_generation(self, tab: str, processing: Any) -> bool:
+    def record_generation_thumbnail(self, processed: Any) -> bytes | None:
+        try:
+            from PIL import Image
+
+            images = processed.images
+            index = processed.index_of_first_image
+            if not 0 <= index < len(images) or not isinstance(images[index], Image.Image):
+                return None
+            thumbnail = images[index]
+            scale = THUMBNAIL_SIZE / max(thumbnail.size)
+            if scale < 1:
+                size = tuple(max(1, round(side * scale)) for side in thumbnail.size)
+                thumbnail = thumbnail.resize(size, Image.Resampling.BILINEAR, reducing_gap=2.0)
+            with BytesIO() as buffer:
+                thumbnail.convert("RGB").save(buffer, "JPEG", quality=72)
+                return buffer.getvalue()
+        except Exception:
+            return None
+
+    def record_direct_generation(self, tab: str, processing: Any, processed: Any = None) -> bool:
         if getattr(processing, "is_api", False) or getattr(processing, "txt2img_upscale", False):
             return False
         if getattr(processing, "_forge_simple_queue_history_recorded", False):
@@ -629,6 +775,15 @@ class SimpleQueue:
             _copy_value(getattr(processing, "cfg_scale", None)),
             _copy_value(getattr(processing, "denoising_strength", None)),
         ]
+        refiner = getattr(processing, "refiner_checkpoint", None)
+        input_keys.extend([
+            f"{tab}_distilled_cfg_scale", f"{tab}_enable-checkbox", f"{tab}_checkpoint",
+            f"{tab}_switch_at", f"{tab}_cfg",
+        ])
+        args.extend([
+            getattr(processing, "distilled_cfg_scale", None), bool(refiner), refiner,
+            getattr(processing, "refiner_switch_at", None), getattr(processing, "refiner_cfg", None) or 0,
+        ])
         if tab == "txt2img":
             input_keys.append("txt2img_hr")
             args.append(bool(getattr(processing, "enable_hr", False)))
@@ -653,8 +808,12 @@ class SimpleQueue:
         started_at = getattr(processing, "_forge_simple_queue_started_at", None) or time.time()
         job.created_at = started_at
         job.started_at = started_at
+        job.generation_started_at = getattr(processing, "_forge_simple_queue_generation_started_at", None)
+        job.eta_load_state = getattr(processing, "_forge_simple_queue_eta_load_state", None)
         job.completed_at = time.time()
         job.status = "done"
+        if processed is not None:
+            job.thumbnail = self.record_generation_thumbnail(processed)
         with self._condition:
             self._append_history_locked(job)
         processing._forge_simple_queue_history_recorded = True
@@ -896,6 +1055,78 @@ class SimpleQueue:
             traceback.print_exc()
             return None
 
+    def _load_eta_timings(self) -> dict[str, Any]:
+        try:
+            with self._eta_path.open("rb") as handle:
+                data = handle.read(ETA_FILE_LIMIT + 1)
+            if len(data) > ETA_FILE_LIMIT:
+                return {}
+            payload = json.loads(data)
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return {}
+            timings = payload.get("profiles")
+            if not isinstance(timings, dict):
+                return {}
+            valid = {}
+            for profile, entry in timings.items():
+                if not isinstance(entry, dict):
+                    continue
+                features, durations = entry.get("features"), entry.get("durations")
+                if not isinstance(features, dict) or not isinstance(durations, list):
+                    continue
+                if not all(key in features for key in (
+                    "tab", "forge", "checkpoint", "steps", "dimensions", "batch", "batch_size",
+                    "sampler", "schedule", "workload", "extra_processing",
+                )):
+                    continue
+                dimensions = features["dimensions"]
+                numbers = [features[key] for key in ("steps", "batch", "batch_size")]
+                if dimensions is not None:
+                    if not isinstance(dimensions, list) or len(dimensions) != 2:
+                        continue
+                    numbers.extend(dimensions)
+                if any(value is not None and (type(value) not in (int, float) or not 0 < value < 1e9) for value in numbers):
+                    continue
+                if dimensions is not None and any(value is None for value in dimensions):
+                    continue
+                samples = [duration for duration in durations if type(duration) in (int, float) and 0 < duration < 1e9]
+                if samples:
+                    valid[profile] = {"features": features, "durations": samples[-ETA_SAMPLES_PER_PROFILE:]}
+            return valid
+        except (OSError, ValueError, RecursionError):
+            return {}
+
+    def _record_eta_timing_locked(self, job: QueueJob, duration: float):
+        self._eta_fallback_cache.clear()
+        profile = job.eta_sample_profile()
+        existing = self._eta_timings.pop(profile, None)
+        durations = existing["durations"] if existing else []
+        self._eta_timings[profile] = {
+            "features": self._timing_features(job),
+            "durations": [*durations, duration][-ETA_SAMPLES_PER_PROFILE:],
+        }
+
+        def encode_timings():
+            return json.dumps({"version": 1, "profiles": self._eta_timings}, separators=(",", ":")).encode("ascii")
+
+        data = encode_timings()
+        while len(data) > ETA_FILE_LIMIT and self._eta_timings:
+            self._eta_timings.pop(next(iter(self._eta_timings)))
+            data = encode_timings()
+
+        temporary = self._eta_path.with_suffix(f".{uuid4().hex}.tmp")
+        try:
+            self._eta_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_bytes(data)
+            temporary.replace(self._eta_path)
+        except OSError as exc:
+            print(f"[Forge Simple Queue] Could not save ETA timings: {exc}")
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _load_recovery_snapshot(self) -> dict[str, Any] | None:
         try:
             if not self._recovery_path.exists():
@@ -961,6 +1192,7 @@ class SimpleQueue:
             "input_keys": list(job.input_keys),
             "forge_state": _copy_value(job.forge_state),
             "username": job.username,
+            "name": job.name,
             "repeat_id": job.repeat_id,
             "repeat_selected": job.repeat_id in self._repeat_order,
             "paused": job.paused,
@@ -986,6 +1218,7 @@ class SimpleQueue:
             item.get("username"),
             repeat_id=str(item.get("repeat_id") or job_id),
             repeat_placeholder=bool(item.get("repeat_placeholder", False)),
+            name=str(item.get("name") or "")[:60],
         )
         job.paused = bool(item.get("paused", False)) or job.repeat_placeholder
         job.status = "queued"
@@ -1014,6 +1247,8 @@ class SimpleQueue:
             fingerprint = job.fingerprint()
             if fingerprint in by_fingerprint:
                 group = by_fingerprint[fingerprint]
+                if job.thumbnail and not group.get("thumbnail"):
+                    group["thumbnail"] = f"/forge-simple-queue/thumbnail/{job.id}"
                 if job.status == "done":
                     group["runs"] += 1
                 if job.status == "failed":
@@ -1035,6 +1270,8 @@ class SimpleQueue:
                 skipped=1 if job.status == "skipped" else 0,
                 interrupted=1 if job.status == "interrupted" else 0,
             )
+            if job.thumbnail:
+                group["thumbnail"] = f"/forge-simple-queue/thumbnail/{job.id}"
             group["timed_runs"] = 0
             group["_duration_total"] = 0.0
             self._add_history_duration(group, job)
@@ -1070,25 +1307,42 @@ class SimpleQueue:
 
         width = number(f"{job.tab}_width")
         height = number(f"{job.tab}_height")
-        dimensions = tuple(sorted((width, height))) if width and height else None
+        dimensions = sorted((width, height)) if width and height else None
         batch_count = number(f"{job.tab}_batch_count")
         batch_size = number(f"{job.tab}_batch_size")
         batch = batch_count * batch_size if batch_count and batch_size else None
+        workload = job.timing_workload()
+        checkpoint = job.forge_state.get("sd_model_checkpoint")
+        sampler = job._arg_by_key(f"{job.tab}_sampling")
+        schedule = job._arg_by_key(f"{job.tab}_scheduler")
+        evaluations = None
+        if isinstance(sampler, str) and sampler:
+            try:
+                from modules.sd_samplers import all_samplers_map
+            except ImportError:
+                all_samplers_map = {}
+            config = all_samplers_map.get(sampler)
+            if config is not None:
+                evaluations = config.total_steps(1)
         return {
             "tab": job.tab,
-            "forge": job.forge_state,
+            "forge": timing_digest({key: value for key, value in job.forge_state.items() if value is not None}),
+            "checkpoint": timing_digest(checkpoint) if checkpoint else None,
             "steps": number(f"{job.tab}_steps"),
-            "sampler": job._arg_by_key(f"{job.tab}_sampling", default=None),
-            "schedule": job._arg_by_key(f"{job.tab}_scheduler", default=None),
+            "sampler": timing_digest(sampler) if sampler is not None else None,
+            "schedule": timing_digest(schedule) if schedule is not None else None,
+            "evaluations": evaluations,
             "dimensions": dimensions,
             "batch": batch,
             "batch_size": batch_size,
-            "workload": job.timing_workload(),
+            "workload": timing_digest(workload),
+            "extra_processing": any(value for key, value in workload.items() if not key.endswith("_denoising_strength")),
+            "load_state": job.eta_load_state,
         }
 
     @classmethod
     def _timing_similarity_score(cls, target: dict[str, Any], candidate: dict[str, Any]) -> float | None:
-        if target["tab"] != candidate["tab"] or not forge_states_match(target["forge"], candidate["forge"]):
+        if target["tab"] != candidate["tab"] or target["forge"] != candidate["forge"]:
             return None
         if target["workload"] != candidate["workload"]:
             return None
@@ -1146,20 +1400,25 @@ class SimpleQueue:
     def _estimate_similar_duration_locked(
         cls,
         job: QueueJob,
-        history_samples: list[tuple[QueueJob, float]],
+        history_samples: list[tuple[dict[str, Any], float]],
     ) -> tuple[float | None, int]:
         target = cls._timing_features(job)
         ranked: list[tuple[float, float]] = []
-        for history_job, duration in history_samples:
-            candidate = cls._timing_features(history_job)
+        for candidate, duration in history_samples:
             score = cls._timing_similarity_score(target, candidate)
             if score is not None:
                 ratio = (target["steps"] / candidate["steps"]
                          * math.prod(target["dimensions"]) / math.prod(candidate["dimensions"])
                          * target["batch"] / candidate["batch"])
-                if ratio != 1.0 and any(value for key, value in target["workload"].items()
-                                        if not key.endswith("_denoising_strength")):
-                    continue
+                if ratio != 1.0 and target["extra_processing"]:
+                    # Keep a fixed allowance for setup and extra passes when only
+                    # the base step count changes in an otherwise identical warm run.
+                    if (candidate.get("load_state") != "warm"
+                            or target["dimensions"] != candidate["dimensions"]
+                            or target["batch"] != candidate["batch"]
+                            or not 0.8 <= ratio <= 1.25):
+                        continue
+                    ratio = 1.0 + (ratio - 1.0) * 0.85
                 # Avoid extrapolating far beyond measured workloads.
                 if 0.5 <= ratio <= 2.0:
                     ranked.append((score, duration * ratio))
@@ -1171,9 +1430,114 @@ class SimpleQueue:
         durations = [duration for score, duration in ranked if score >= best_score - 1.0][:5]
         return float(statistics.median(durations)), len(durations)
 
+    @classmethod
+    def _estimate_rough_duration(cls, job: QueueJob, history_samples: list[tuple[dict[str, Any], float]]) -> tuple[float | None, int]:
+        target = cls._timing_features(job)
+        checkpoint = target["checkpoint"]
+        if not checkpoint or any(target[key] is None for key in ("steps", "dimensions", "batch")):
+            return None, 0
+        ranked = []
+        for candidate, duration in history_samples:
+            if any(candidate[key] is None for key in ("steps", "dimensions", "batch")):
+                continue
+            ratio = (target["steps"] / candidate["steps"]
+                     * math.prod(target["dimensions"]) / math.prod(candidate["dimensions"])
+                     * target["batch"] / candidate["batch"])
+            if not math.isfinite(ratio) or ratio <= 0:
+                continue
+            # Prefer timings from the same model and similar pipelines.
+            score = (
+                4 * (checkpoint == candidate["checkpoint"])
+                + 2 * (target["tab"] == candidate["tab"])
+                + 2 * (target["workload"] == candidate["workload"])
+                + (target["sampler"] == candidate["sampler"])
+                + (target["batch_size"] == candidate["batch_size"])
+                - abs(math.log2(ratio))
+            )
+            # Use Forge's per-step evaluation count only for an otherwise similar
+            # workload. Keep some of the measured time for work outside the sampler.
+            target_evaluations = target.get("evaluations")
+            candidate_evaluations = candidate.get("evaluations")
+            if (target_evaluations in (1, 2) and candidate_evaluations in (1, 2)
+                    and target_evaluations != candidate_evaluations
+                    and checkpoint == candidate["checkpoint"] and target["tab"] == candidate["tab"]
+                    and target["workload"] == candidate["workload"]
+                    and target["dimensions"] == candidate["dimensions"] and target["batch"] == candidate["batch"]):
+                ratio *= target_evaluations / candidate_evaluations
+                scaled = duration * (1.0 + 0.85 * (max(0.25, min(4.0, ratio)) - 1.0))
+            else:
+                scaled = duration * math.sqrt(max(0.25, min(4.0, ratio)))
+            ranked.append((score, scaled))
+        if not ranked:
+            return None, 0
+        ranked.sort(key=lambda sample: sample[0], reverse=True)
+        best = ranked[0][0]
+        durations = [duration for score, duration in ranked if score >= best - 1.5][:5]
+        return float(statistics.median(durations)), len(durations)
+
+    @staticmethod
+    def _predict_eta_load_state(job: QueueJob) -> str | None:
+        if job.eta_load_state is not None:
+            return job.eta_load_state
+        try:
+            from modules.sd_models import checkpoint_aliases, model_data
+            from modules_forge.main_entry import forge_unet_storage_dtype_options
+        except ImportError:
+            return None
+
+        if job._arg_by_key(f"{job.tab}_override_settings"):
+            return None
+        checkpoint = job.forge_state.get("sd_model_checkpoint")
+        if not isinstance(checkpoint, str) or not checkpoint:
+            return None
+        expected = checkpoint_aliases.get(checkpoint)
+        if expected is None:
+            return None
+        modules = job.forge_state.get("forge_additional_modules", getattr(shared.opts, "forge_additional_modules", []))
+        dtype_name = job.forge_state.get("forge_unet_storage_dtype", getattr(shared.opts, "forge_unet_storage_dtype", None))
+        dtype, _ = forge_unet_storage_dtype_options.get(dtype_name, (None, False))
+        requested = dict(checkpoint_info=expected, additional_modules=modules, unet_storage_dtype=dtype)
+        return "warm" if model_data.forge_hash == str(requested) else "reload"
+
+    @staticmethod
+    def _live_remaining_seconds(job: QueueJob, now: float) -> float | None:
+        if not job.live_eta_enabled or getattr(progress, "current_task", None) != job.task_id:
+            return None
+        state = getattr(shared, "state", None)
+        if state is None or getattr(state, "job_no", None) != 0:
+            return None
+        if getattr(state, "interrupted", False) or getattr(state, "skipped", False):
+            return None
+        total, completed = getattr(state, "sampling_steps", 0), getattr(state, "preview_step", 0)
+        if total < 8:
+            return None
+        observations = job.live_eta_observations
+        if observations and (completed < observations[-1][0] or total != job.live_eta_steps):
+            job.live_eta_enabled = False
+            return None
+        if not 0 < completed < total:
+            return None
+        job.live_eta_steps = total
+        if not observations or (completed > observations[-1][0] and now - observations[-1][1] >= 0.3):
+            observations.append((completed, now))
+        first_step, first_at = observations[0]
+        last_step, last_at = observations[-1]
+        span = last_step - first_step
+        if completed != last_step or span < 4 or last_at - first_at < 0.75:
+            return None
+        seconds_per_step = (last_at - first_at) / span
+        stale_for = now - last_at
+        if stale_for > max(2.0, seconds_per_step * 3):
+            return None
+        # Leave about one step's worth of time for decoding and finalization.
+        return max(seconds_per_step, seconds_per_step * (total - last_step + 1) - stale_for)
+
     def _estimate_remaining_locked(self, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         active_job = self._active or self._waiting
+        stage = None
+        if self._active is not None and self._active.status == "running" and self._active.tracks_generation_stage:
+            stage = "generating" if self._active.generation_started_at is not None else "preparing"
         queue_jobs: list[QueueJob] = []
         seen: set[int] = set()
         for job in [active_job, *self._pending]:
@@ -1185,58 +1549,134 @@ class SimpleQueue:
             return {"seconds": None, "sample_count": 0, "unknown_jobs": 0}
 
         samples: dict[str, list[float]] = {}
-        history_samples: list[tuple[QueueJob, float]] = []
+        recent_samples = []
         for job in self._history:
-            duration = job.duration_seconds()
+            duration = job.eta_duration_seconds()
             if job.status != "done" or duration is None or not math.isfinite(duration) or duration <= 0:
                 continue
-            profile_samples = samples.setdefault(job.timing_profile(), [])
-            if len(profile_samples) < 5:
+            profile = job.eta_sample_profile()
+            if profile in self._eta_timings:
+                continue
+            profile_samples = samples.setdefault(profile, [])
+            if len(profile_samples) < ETA_SAMPLES_PER_PROFILE:
                 profile_samples.append(duration)
-            history_samples.append((job, duration))
+            recent_samples.append((self._timing_features(job), duration))
 
-        estimates: dict[str, float] = {
-            profile: float(statistics.median(durations))
-            for profile, durations in samples.items()
-        }
+        history_samples = None
+        fallback_pools = {}
+        exact_samples: dict[str, int] = {}
         unknown_jobs = 0
         total_seconds = 0.0
-        used_profiles: set[str] = set()
         fallback_sample_count = 0
         fallback_estimates: dict[str, tuple[float | None, int]] = {}
         approximate = False
+        overdue = False
+        live = False
+        rough_profiles: set[str] = set()
         for job in queue_jobs:
+            live_remaining = (
+                self._live_remaining_seconds(job, now)
+                if job is self._active and stage == "generating" else None
+            )
             profile = job.timing_profile()
-            estimate = estimates.get(profile)
-            if estimate is None:
-                if profile not in fallback_estimates:
-                    fallback_estimates[profile] = self._estimate_similar_duration_locked(job, history_samples)
-                    fallback_sample_count += fallback_estimates[profile][1]
-                estimate, _ = fallback_estimates[profile]
-                if estimate is None:
-                    unknown_jobs += 1
-                    continue
-                approximate = True
+            load_state = self._predict_eta_load_state(job)
+            generation_profile = f"{profile}:generation"
+            warm_profile = f"{generation_profile}:warm"
+            preferred_profile = f"{generation_profile}:reload" if load_state == "reload" else warm_profile
+            durations = None
+            for key in dict.fromkeys((preferred_profile, warm_profile, generation_profile, profile)):
+                stored = self._eta_timings.get(key)
+                durations = stored["durations"] if stored else samples.get(key)
+                if durations:
+                    break
+            estimate_key = (profile, load_state)
+            if durations:
+                estimate = float(statistics.median(durations))
+                exact_samples[key] = len(durations)
+                if load_state is not None and key != preferred_profile:
+                    rough_profiles.add(estimate_key)
+                    approximate = True
             else:
-                used_profiles.add(profile)
-            if job is active_job and job is self._active and job.status == "running" and job.started_at is not None:
-                elapsed = max(0.0, now - job.started_at)
-                if elapsed >= estimate:
+                if estimate_key not in fallback_estimates:
+                    cached = self._eta_fallback_cache.get(estimate_key) if not recent_samples else None
+                    if cached is None:
+                        if history_samples is None:
+                            history_samples = recent_samples + [
+                                (entry["features"], float(statistics.median(entry["durations"])))
+                                for key, entry in reversed(self._eta_timings.items())
+                                if f"{key}:generation" not in self._eta_timings and f"{key}:warm" not in self._eta_timings
+                            ]
+                        if load_state not in fallback_pools:
+                            warm, legacy, reloads = [], [], []
+                            for sample in history_samples:
+                                state = sample[0].get("load_state")
+                                (warm if state == "warm" else reloads if state == "reload" else legacy).append(sample)
+                            fallback_pools[load_state] = (reloads, warm, legacy) if load_state == "reload" else (warm, legacy)
+                        estimate, count, rough = None, 0, False
+                        for index, pool in enumerate(fallback_pools[load_state]):
+                            if not pool:
+                                continue
+                            estimate, count = self._estimate_similar_duration_locked(job, pool)
+                            if estimate is None:
+                                estimate, count = self._estimate_rough_duration(job, pool)
+                                rough = estimate is not None
+                            if estimate is not None:
+                                rough = rough or (load_state is not None and index > 0)
+                                break
+                        if not recent_samples and len(self._eta_fallback_cache) < 128:
+                            self._eta_fallback_cache[estimate_key] = estimate, count, rough
+                    else:
+                        estimate, count, rough = cached
+                    if rough:
+                        rough_profiles.add(estimate_key)
+                    fallback_estimates[estimate_key] = estimate, count
+                    fallback_sample_count += count
+                estimate, _ = fallback_estimates[estimate_key]
+                if estimate is not None:
+                    approximate = True
+            if job is self._active and job.status == "running" and stage != "preparing":
+                started_at = job.generation_started_at if job.generation_started_at is not None else job.started_at
+                elapsed = max(0.0, now - started_at) if started_at is not None else 0.0
+                historical_remaining = estimate - elapsed if estimate is not None else None
+                if live_remaining is not None and (
+                    historical_remaining is None
+                    or historical_remaining <= 0
+                    or abs(live_remaining - historical_remaining) >= max(0.3, estimate * 0.15)
+                ):
+                    total_seconds += live_remaining
+                    live = approximate = True
+                    continue
+                if historical_remaining is not None and historical_remaining <= 0:
+                    overdue = True
                     unknown_jobs += 1
                     continue
-                estimate -= elapsed
-            total_seconds += estimate
+                estimate = historical_remaining
+            if estimate is None:
+                unknown_jobs += 1
+            else:
+                total_seconds += estimate
 
         if unknown_jobs:
             return {
                 "seconds": None,
-                "sample_count": sum(len(samples[profile]) for profile in used_profiles) + fallback_sample_count,
+                "known_seconds": round(total_seconds, 3) if total_seconds > 0 else None,
+                "stage": stage,
+                "live": live,
+                "live_enabled": stage == "generating" and active_job.live_eta_enabled,
+                "overdue": overdue,
+                "rough": bool(rough_profiles),
+                "sample_count": sum(exact_samples.values()) + fallback_sample_count,
                 "unknown_jobs": unknown_jobs,
                 "approximate": approximate,
             }
         return {
-            "seconds": round(total_seconds, 1),
-            "sample_count": sum(len(samples[profile]) for profile in used_profiles) + fallback_sample_count,
+            "seconds": round(total_seconds, 3),
+            "stage": stage,
+            "live": live,
+            "live_enabled": stage == "generating" and active_job.live_eta_enabled,
+            "overdue": overdue,
+            "rough": bool(rough_profiles),
+            "sample_count": sum(exact_samples.values()) + fallback_sample_count,
             "unknown_jobs": 0,
             "approximate": approximate,
         }
@@ -1245,6 +1685,9 @@ class SimpleQueue:
         if any(item.id == job.id for item in self._history):
             return
         self._history.appendleft(job.clone_for_history())
+        duration = job.eta_duration_seconds()
+        if job.status == "done" and duration is not None and 0 < duration < 1e9:
+            self._record_eta_timing_locked(job, duration)
 
     def delete(self, job_id: str) -> dict[str, Any]:
         deleted = False
@@ -1314,13 +1757,18 @@ class SimpleQueue:
             self._schedule_recovery_checkpoint()
         return self.snapshot()
 
-    def move(self, job_id: str, index: int) -> dict[str, Any]:
+    def move(self, job_id: str, index: int, *, target_id: str | None = None, after: bool = False) -> dict[str, Any]:
         moved = False
         with self._condition:
             jobs = list(self._pending)
             job = next((item for item in jobs if item.id == job_id), None)
-            if job is not None:
+            target = None
+            if target_id is not None:
+                target = next((item for item in jobs if item.id == target_id and item is not job), None)
+            if job is not None and (target_id is None or target is not None):
                 jobs.remove(job)
+                if target is not None:
+                    index = jobs.index(target) + int(after)
                 index = max(0, min(index, len(jobs)))
                 jobs.insert(index, job)
                 self._pending = deque(jobs)
@@ -1345,11 +1793,86 @@ class SimpleQueue:
             self._schedule_recovery_checkpoint()
         return self.snapshot()
 
-    def begin_full_edit(self, job_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _job_has_refiner_inputs(job: QueueJob) -> bool:
+        return all(f"{job.tab}_{suffix}" in job.input_keys for suffix in ("enable-checkbox", "checkpoint"))
+
+    def update_settings(self, job_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+        with self._condition:
+            job = next((item for item in self._pending if item.id == job_id), None)
+            if job is None or job.editing or job.cancel_requested:
+                return {"ok": False, "message": "This job is no longer available for editing."}
+            checkpoint = settings.get("checkpoint")
+            refiner = settings.get("refiner")
+            choices = ()
+            if checkpoint is not None or refiner is not None:
+                choices = shared.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
+            if checkpoint is not None and checkpoint != job.forge_state.get("sd_model_checkpoint"):
+                if checkpoint not in choices:
+                    return {"ok": False, "message": "Choose an available Checkpoint."}
+                overrides = job._arg_by_key(f"{job.tab}_override_settings") or []
+                if overrides:
+                    from modules.infotext_utils import create_override_settings_dict
+
+                    if "sd_model_checkpoint" in create_override_settings_dict(overrides):
+                        return {"ok": False, "message": "Clear the model override in Full Edit before changing Checkpoint."}
+
+            tab = job.tab
+            if refiner is not None:
+                if refiner != "" and refiner not in choices:
+                    return {"ok": False, "message": "Choose an available Refiner."}
+                if not self._job_has_refiner_inputs(job):
+                    return {"ok": False, "message": "Refiner is unavailable for this job."}
+
+            img2img = tab == "img2img"
+            numeric_fields = {
+                "cfg": ("cfg_scale", 1, 24, 0.5),
+                "distilled_cfg": ("distilled_cfg_scale", 0 if img2img else 1, 24, 0.5),
+                "steps": ("steps", 1, 150, 1),
+                "width": ("width", 64, 2048 if img2img else 4096, 1),
+                "height": ("height", 64, 2048 if img2img else 4096, 1),
+                "batch_count": ("batch_count", 1, 128, 1),
+                "batch_size": ("batch_size", 1, 8, 1),
+                "denoising": ("denoising_strength", 0, 1, 0.01 if img2img else 0.05),
+                "refiner_switch": ("switch_at", 0, 1, 0.025),
+                "refiner_cfg": ("cfg", 0, 24, 0.5),
+            }
+            updates = {}
+            for field, (suffix, minimum, maximum, step) in numeric_fields.items():
+                value = settings.get(field)
+                if value is None:
+                    continue
+                key = f"{tab}_{suffix}"
+                if job._arg_by_key(key) is None:
+                    return {"ok": False, "message": f"{field.replace('_', ' ').capitalize()} is unavailable for this job."}
+                if type(value) not in (int, float) or not minimum <= value <= maximum or not math.isclose(
+                    value / step, round(value / step), abs_tol=1e-8
+                ):
+                    return {"ok": False, "message": f"Enter a value from {minimum} to {maximum} in steps of {step}."}
+                updates[job.input_keys.index(key)] = int(value) if step == 1 else value
+
+            if checkpoint is not None:
+                job.forge_state["sd_model_checkpoint"] = checkpoint
+            if refiner is not None:
+                updates[job.input_keys.index(f"{tab}_enable-checkbox")] = bool(refiner)
+                updates[job.input_keys.index(f"{tab}_checkpoint")] = refiner or "None"
+            for index, value in updates.items():
+                job.args[index] = value
+            job._fingerprint_cache = None
+            job._summary_snapshot = None
+            if job.repeat_id in self._repeat_order:
+                self._repeat_templates[job.repeat_id] = job
+            self._condition.notify_all()
+        self._schedule_recovery_checkpoint()
+        return {"ok": True, "message": "Queued settings updated."}
+
+    def begin_full_edit(self, job_id: str, input_keys: list[str | None] | None = None) -> dict[str, Any]:
         with self._condition:
             job = next((item for item in self._pending if item.id == job_id), None)
             if job is None or job.status not in ("queued", "waiting") or job.cancel_requested:
                 return {"ok": False, "message": "This queued job can no longer be edited."}
+            if input_keys is not None and (job.input_keys != input_keys or len(job.args) != len(input_keys)):
+                return {"ok": False, "message": "The current page inputs do not match this queued job."}
             job.editing = True
             self._condition.notify_all()
             result = {"ok": True, "args": [_copy_value(value) for value in job.args]}
@@ -1388,12 +1911,49 @@ class SimpleQueue:
         self._schedule_recovery_checkpoint()
         return result
 
+    def _default_job_name_locked(self, job: QueueJob, base: str = "") -> str:
+        jobs = list(self._iter_jobs_locked(include_history=True))
+        if not base:
+            previous = max(
+                (item for item in jobs if item.tab == job.tab and item.source == "queue"),
+                key=lambda item: item.created_at,
+                default=None,
+            )
+            if previous is not None:
+                previous_parts = {part.strip().casefold() for part in previous.prompt.split(",")}
+                parts = [part.strip() for part in job.prompt.split(",") if part.strip()]
+                if any(part.casefold() in previous_parts for part in parts):
+                    base = next((part for part in parts if part.casefold() not in previous_parts), "")
+
+        names = {item.name.casefold() for item in jobs}
+        base = base[:55].strip()
+        if base and base.casefold() not in names:
+            return base
+        base = base or "Job"
+        number = 2 if base != "Job" else 1
+        while f"{base} {number}".casefold() in names:
+            number += 1
+        return f"{base} {number}"
+
+    def rename_job(self, job_id: str, name: Any) -> dict[str, Any]:
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 60:
+            return {"ok": False, "message": "Enter a name from 1 to 60 characters."}
+        with self._condition:
+            job = self._find_job_locked(job_id)
+            if job is None:
+                return {"ok": False, "message": "The job is no longer available."}
+            job.name = name.strip()
+        self._schedule_recovery_checkpoint()
+        return {"ok": True, "name": job.name}
+
     def copy_job(self, job_id: str) -> dict[str, Any]:
         with self._condition:
             source = self._find_job_locked(job_id)
             if source is None:
                 return {"ok": False, "message": "The source job is no longer available."}
-            self._pending.append(source.clone_as_copy())
+            job = source.clone_as_copy()
+            job.name = self._default_job_name_locked(job, source.name)
+            self._pending.append(job)
             self._condition.notify_all()
         self._schedule_recovery_checkpoint()
         result = self.snapshot()
@@ -1661,6 +2221,7 @@ class SimpleQueue:
                         self._waiting = None
                     job.status = "running"
                     job.started_at = time.time()
+                    job.tracks_generation_stage = True
                     self._active = job
 
                 self._checkpoint_recovery()
@@ -1719,6 +2280,10 @@ class SimpleQueue:
                     elif shared.state.skipped:
                         job.termination_reason = "skipped"
                 return result
+            except Exception as exc:
+                job.termination_reason = "failed"
+                job.error = f"{type(exc).__name__}: {exc}"
+                raise
             finally:
                 progress.finish_task(job.task_id)
                 shared.state.end()
@@ -1762,6 +2327,7 @@ SIMPLE_QUEUE_ASSETS = r"""
 }
 #txt2img_simple_queue_button, #img2img_simple_queue_button,
 #txt2img_simple_queue_button button, #img2img_simple_queue_button button,
+.forge-simple-queue-view-button,
 #txt2img_simple_queue_update, #img2img_simple_queue_update,
 #txt2img_simple_queue_update button, #img2img_simple_queue_update button,
 #txt2img_simple_queue_cancel, #img2img_simple_queue_cancel,
@@ -1784,19 +2350,6 @@ SIMPLE_QUEUE_ASSETS = r"""
 #txt2img_simple_queue_update button, #img2img_simple_queue_update button,
 #txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
   flex: 1 1 0;
-}
-#txt2img_simple_queue_view, #img2img_simple_queue_view,
-#txt2img_simple_queue_button button, #img2img_simple_queue_button button,
-#txt2img_simple_queue_view button, #img2img_simple_queue_view button {
-  background: #465467 !important;
-  border-color: #5b6b80 !important;
-  color: #f8fafc !important;
-}
-#txt2img_simple_queue_view:hover, #img2img_simple_queue_view:hover,
-#txt2img_simple_queue_button button:hover, #img2img_simple_queue_button button:hover,
-#txt2img_simple_queue_view button:hover, #img2img_simple_queue_view button:hover {
-  background: #526278 !important;
-  border-color: #7a8ca4 !important;
 }
 #txt2img_simple_queue_update button, #img2img_simple_queue_update button,
 #txt2img_simple_queue_cancel button, #img2img_simple_queue_cancel button {
@@ -1909,8 +2462,10 @@ button.fsq-queue-paused:focus {
   flex: 0 0 auto;
 }
 .fsq-select-all {
+  box-sizing: border-box;
   width: 34px;
-  height: 32px;
+  height: 34px;
+  padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2155,14 +2710,14 @@ button.fsq-queue-paused:focus {
 .fsq-panel button {
   transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, transform 0.14s ease;
 }
-.fsq-panel button:not(:disabled):not(.fsq-close):hover {
+.fsq-panel button:not(:disabled):not(.fsq-close):not(.fsq-job-name):hover {
   background: #334155;
   border-color: rgba(147, 197, 253, 0.56);
   color: #f8fafc;
   box-shadow: 0 3px 10px rgba(15, 23, 42, 0.32);
   transform: translateY(-1px);
 }
-.fsq-panel button:not(:disabled):not(.fsq-close):active {
+.fsq-panel button:not(:disabled):not(.fsq-close):not(.fsq-job-name):active {
   transform: translateY(0);
   box-shadow: none;
 }
@@ -2185,8 +2740,8 @@ button.fsq-queue-paused:focus {
   scrollbar-width: thin;
   scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
 }
-.fsq-body::-webkit-scrollbar {
-  width: 8px;
+.fsq-body::-webkit-scrollbar, .fsq-model-choices::-webkit-scrollbar {
+  width: 5px;
 }
 .fsq-body::-webkit-scrollbar-track {
   background: transparent;
@@ -2259,12 +2814,13 @@ button.fsq-queue-paused:focus {
   cursor: pointer;
 }
 .fsq-handle {
+  display: grid;
+  place-items: center;
   width: 24px;
   height: 28px;
   border: 0;
   background: transparent;
   color: #9ca3af;
-  cursor: grab;
   font-size: 17px;
   line-height: 1;
 }
@@ -2274,6 +2830,33 @@ button.fsq-queue-paused:focus {
   text-overflow: ellipsis;
   font-weight: 700;
   color: #f9fafb;
+}
+.fsq-job-name, .fsq-name-input {
+  min-width: 0;
+  max-width: 100%;
+  font: inherit;
+  color: inherit;
+}
+.fsq-job-name {
+  appearance: none;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: transparent;
+  cursor: text;
+}
+.fsq-job-name:hover {
+  text-decoration: underline;
+}
+.fsq-name-input {
+  width: min(100%, 240px);
+  padding: 0 3px;
+  border-radius: 4px;
+  background: #111827;
 }
 .fsq-identity {
   display: flex;
@@ -2381,6 +2964,81 @@ button.fsq-queue-paused:focus {
   gap: 8px;
   margin-top: 8px;
 }
+.fsq-thumbnail {
+  grid-column: 1 / 3;
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  border-radius: 6px;
+  background: #111827;
+}
+.fsq-settings-editor {
+  position: relative;
+  display: inline-block;
+  vertical-align: middle;
+  z-index: 2;
+}
+.fsq-settings-editor input, .fsq-model-choices {
+  position: absolute;
+  left: 0;
+  width: min(16rem, 55vw);
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid #475569;
+  border-radius: 5px;
+  background: #111827;
+  color: inherit;
+  font: inherit;
+}
+.fsq-settings-editor input {
+  top: 50%;
+  height: 22px;
+  transform: translateY(-50%);
+}
+.fsq-settings-editor input[type="number"] {
+  width: 5em;
+}
+.fsq-model-choices {
+  top: calc(50% + 13px);
+  display: block;
+  max-height: 8rem;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: #475569 transparent;
+}
+.fsq-model-choices-above {
+  top: auto;
+  bottom: calc(50% + 13px);
+}
+.fsq-model-choice {
+  display: block;
+  min-height: 22px;
+  width: 100%;
+  padding: 2px 4px;
+}
+.fsq-model-choice:hover, .fsq-model-choice:focus-visible {
+  color: #e2e8f0;
+  background: #253246;
+}
+.fsq-toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 100000;
+  max-width: min(360px, calc(100vw - 48px));
+  padding: 10px 14px;
+  border: 1px solid #488465;
+  border-radius: 8px;
+  background: #132a22;
+  color: #dcfce7;
+}
+.fsq-toast-error {
+  border-color: #995454;
+  background: #351f24;
+  color: #fee2e2;
+}
 .fsq-details-panel {
   display: none;
   grid-column: 3 / 5;
@@ -2439,12 +3097,40 @@ class Script(scripts.Script):
         return scripts.AlwaysVisible
 
     def before_process(self, processing, *args):
+        if not hasattr(processing, "_forge_simple_queue_model_before"):
+            processing._forge_simple_queue_model_before = loaded_model_signature()
         if not queue._is_queue_generation() and not getattr(processing, "_forge_simple_queue_started_at", None):
             processing._forge_simple_queue_started_at = time.time()
 
+    def process(self, processing, *args):
+        if getattr(processing, "is_api", False):
+            return
+        now = time.time()
+        if not getattr(processing, "_forge_simple_queue_generation_started_at", None):
+            processing._forge_simple_queue_generation_started_at = now
+            before = getattr(processing, "_forge_simple_queue_model_before", None)
+            after = loaded_model_signature()
+            if before is not None and after:
+                processing._forge_simple_queue_eta_load_state = "warm" if before == after else "reload"
+        load_state = getattr(processing, "_forge_simple_queue_eta_load_state", None)
+        task_id = getattr(progress, "current_task", None) or getattr(getattr(shared, "state", None), "job", None)
+        with queue._condition:
+            job = queue._active
+            if job is not None and job.task_id == task_id and job.generation_started_at is None:
+                job.generation_started_at = now
+                job.eta_load_state = load_state
+                job.live_eta_enabled = job.supports_live_eta(processing)
+
     def postprocess(self, processing, processed, *args):
         tab = "img2img" if self.is_img2img else "txt2img"
-        if queue.record_direct_generation(tab, processing):
+        if getattr(processing, "is_api", False):
+            return
+        task_id = getattr(progress, "current_task", None) or getattr(getattr(shared, "state", None), "job", None)
+        with queue._condition:
+            active_job = queue._active
+        if active_job is not None and task_id == active_job.task_id:
+            active_job.thumbnail = queue.record_generation_thumbnail(processed)
+        elif queue.record_direct_generation(tab, processing, processed):
             print(f"[Forge Simple Queue] Recorded direct {tab} generation in history.")
 
     def after_component(self, component, **_kwargs):
@@ -2514,7 +3200,7 @@ class Script(scripts.Script):
                         self.full_edit_update_button = gr.Button("Update", variant="secondary", elem_id=f"{tab}_simple_queue_update", elem_classes=["forge-simple-queue-full-edit-update"])
                         self.full_edit_cancel_button = gr.Button("Cancel", elem_id=f"{tab}_simple_queue_cancel", elem_classes=["forge-simple-queue-full-edit-cancel"])
                 self.full_edit_actions = full_edit_actions
-                gr.Button("", elem_id=f"{tab}_simple_queue_view", elem_classes=["forge-simple-queue-view-button"])
+                gr.Button("", elem_id=f"{tab}_simple_queue_view", elem_classes=["forge-simple-queue-view-button"], variant="secondary")
             self.full_edit_job_id = gr.Textbox("", visible=False, elem_id=f"{tab}_simple_queue_full_edit_job_id")
             self.full_edit_load_button = gr.Button("", visible=False, elem_id=f"{tab}_simple_queue_full_edit_load")
             self.reuse_job_id = gr.Textbox("", visible=False, elem_id=f"{tab}_simple_queue_reuse_job_id")
@@ -2524,27 +3210,44 @@ class Script(scripts.Script):
     def _bind_queue_button(self, tab: str, inputs: list[Any]):
         input_keys = [getattr(component, "elem_id", None) for component in inputs]
 
-        def enqueue_current(request: gr.Request, *args):
-            return queue.enqueue(tab, request, args, input_keys)
+        def enqueue_current(request: gr.Request, checkpoint: str | None, *args):
+            return queue.enqueue(tab, request, args, input_keys, checkpoint=checkpoint)
 
-        self.queue_button.click(
-            fn=enqueue_current,
-            inputs=inputs,
-            outputs=self.queue_status,
-            show_progress=False,
-            queue=False,
-        )
+        # Gradio also constructs dropdowns when processing updates outside UI setup.
+        enqueue_bound = False
 
-        def load_full_edit(job_id: str):
-            result = queue.begin_full_edit(job_id)
+        def bind_enqueue(component, **_kwargs):
+            nonlocal enqueue_bound
+            if enqueue_bound or component.elem_id != "setting_sd_model_checkpoint" or get_blocks_context() is None:
+                return
+            label = "img2img" if tab == "img2img" else "Txt2img"
+            if label in shared.opts.hidden_tabs:
+                return
+            self.queue_button.click(
+                fn=enqueue_current,
+                inputs=[component, *inputs],
+                outputs=self.queue_status,
+                show_progress=False,
+                queue=False,
+            )
+            enqueue_bound = True
+
+        script_callbacks.on_after_component(bind_enqueue)
+
+        main_page_settings = gr.State(value=None)
+
+        def load_full_edit(job_id: str, existing_settings, *current_args):
+            result = queue.begin_full_edit(job_id, input_keys)
             if not result["ok"]:
-                return [gr.update() for _ in inputs] + [gr.update(visible=True), gr.update(visible=False)]
-            return result["args"] + [gr.update(visible=False), gr.update(visible=True)]
+                status = full_edit_status(job_id, result, close=True)
+                return [gr.skip() for _ in inputs] + [gr.update(visible=True), gr.update(visible=False), status, gr.skip()]
+            original_settings = existing_settings if existing_settings is not None else [_copy_value(value) for value in current_args]
+            return result["args"] + [gr.update(visible=False), gr.update(visible=True), gr.skip(), original_settings]
 
         self.full_edit_load_button.click(
             fn=load_full_edit,
-            inputs=[self.full_edit_job_id],
-            outputs=[*inputs, self.queue_actions, self.full_edit_actions],
+            inputs=[self.full_edit_job_id, main_page_settings, *inputs],
+            outputs=[*inputs, self.queue_actions, self.full_edit_actions, self.queue_status, main_page_settings],
             show_progress=False,
             queue=False,
         )
@@ -2563,29 +3266,41 @@ class Script(scripts.Script):
             queue=False,
         )
 
-        def finish_full_edit(request: gr.Request, job_id: str, *args):
-            result = queue.finish_full_edit(job_id, args)
-            if result["ok"]:
-                return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
-            return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
+        def full_edit_status(job_id: str, result: dict[str, Any], close: bool):
+            return (
+                f'<span data-fsq-full-edit-job="{html.escape(job_id or "")}" '
+                f'data-fsq-ok="{int(result["ok"])}" data-fsq-close="{int(close)}" '
+                f'data-fsq-event="{uuid4().hex}">{html.escape(result["message"])}</span>'
+            )
 
-        def cancel_full_edit(job_id: str):
+        def restore_main_page(status, original_settings):
+            values = original_settings if original_settings is not None else [gr.skip() for _ in inputs]
+            return status, gr.update(value=""), gr.update(visible=True), gr.update(visible=False), *values, None
+
+        def finish_full_edit(job_id: str, original_settings, *args):
+            result = queue.finish_full_edit(job_id, args)
+            status = full_edit_status(job_id, result, close=result["ok"])
+            if not result["ok"]:
+                return status, gr.skip(), gr.skip(), gr.skip(), *[gr.skip() for _ in inputs], gr.skip()
+            return restore_main_page(status, original_settings)
+
+        def cancel_full_edit(job_id: str, original_settings):
             result = queue.cancel_full_edit(job_id)
-            if result["ok"]:
-                return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
-            return result["message"], gr.update(value=""), gr.update(visible=True), gr.update(visible=False)
+            return restore_main_page(full_edit_status(job_id, result, close=True), original_settings)
+
+        full_edit_outputs = [self.queue_status, self.full_edit_job_id, self.queue_actions, self.full_edit_actions, *inputs, main_page_settings]
 
         self.full_edit_update_button.click(
             fn=finish_full_edit,
-            inputs=[self.full_edit_job_id, *inputs],
-            outputs=[self.queue_status, self.full_edit_job_id, self.queue_actions, self.full_edit_actions],
+            inputs=[self.full_edit_job_id, main_page_settings, *inputs],
+            outputs=full_edit_outputs,
             show_progress=False,
             queue=False,
         )
         self.full_edit_cancel_button.click(
             fn=cancel_full_edit,
-            inputs=[self.full_edit_job_id],
-            outputs=[self.queue_status, self.full_edit_job_id, self.queue_actions, self.full_edit_actions],
+            inputs=[self.full_edit_job_id, main_page_settings],
+            outputs=full_edit_outputs,
             show_progress=False,
             queue=False,
         )
